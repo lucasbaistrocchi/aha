@@ -371,7 +371,9 @@ testing_sheet_id <- function()
 # Metric catalogue: display grouping + direction. `higher_better = FALSE`
 # metrics (body fat, time-to-takeoff, time-to-peak-force) invert their
 # rankings and percentiles so "good" is always the top of the chart.
-TEST_METRICS <- tribble(
+# tibble:: qualified so this table builds even if the file is ever sourced
+# before global.R attaches the packages.
+TEST_METRICS <- tibble::tribble(
   ~metric,                      ~group,           ~unit,  ~higher_better,
   "Height (in)",                "Anthropometry",  "in",   TRUE,
   "Weight",                     "Anthropometry",  "lbs",  TRUE,
@@ -407,7 +409,7 @@ TEST_METRICS <- tribble(
 
 # Metrics shown on the Individual Report percentile chart, in display order
 # (top to bottom). A fixed set keeps reports comparable athlete to athlete.
-REPORT_METRICS <- tribble(
+REPORT_METRICS <- tibble::tribble(
   ~metric,                  ~label,
   "Jump Height (m)",        "CMJ Jump Height",
   "SBJ (in)",               "SBJ",
