@@ -1,63 +1,4 @@
-# ==============================================================================
-# app.R -- Rugby Union Athlete Management System
-# Run locally: shiny::runApp("rugby-ams")
-#
-# Environment variables (see DEPLOYMENT.md):
-#   APP_PASSWORD              shared password for the login gate
-#   GS4_SERVICE_ACCOUNT_JSON  service-account key (path or JSON text)
-#   AVAILABILITY_SHEET_ID     sheet the availability board writes to
-#   GPS_SHEET_ID / WELLNESS_SHEET_ID / TESTING_SHEET_ID  (optional overrides)
-#   CATAPULT_API_TOKEN        optional; switches GPS to the OpenField API
-# ==============================================================================
-
-# ------------------------------------------------------------------------------
-# Locate the app directory before anything else.
-# A hosted deploy can start the R process at the REPOSITORY ROOT rather than
-# the folder holding app.R (e.g. when the repo keeps everything inside a
-# rugby-ams/ subfolder). If that happens, "R/" and "data/" resolve to nothing:
-# no packages load, no modules exist, and the first error you see is a
-# baffling `could not find function "page_fluid"`. So: find R/global.R, move
-# there, and fail loudly with a useful message if it genuinely isn't present.
-# ------------------------------------------------------------------------------
-if (!file.exists(file.path("R", "global.R"))) {
-  subdirs <- list.dirs(".", recursive = FALSE)
-  hit <- subdirs[file.exists(file.path(subdirs, "R", "global.R"))]
-  if (length(hit) >= 1) {
-    setwd(hit[1])   # also makes data/ paths (roster, workbook) resolve
-    message("app.R: switched working directory to ", normalizePath(getwd()))
-  } else {
-    # List what IS here -- a missing R/ folder is almost always an upload
-    # that dropped nested directories, and seeing the actual contents
-    # settles it immediately instead of guessing from the logs.
-    here <- sort(list.files(".", all.files = TRUE, no.. = TRUE))
-    stop("Cannot find R/global.R from '", normalizePath(getwd()), "'.\n",
-         "Contents of that directory: ",
-         if (length(here)) paste(here, collapse = ", ") else "(empty)", "\n",
-         "Expected app.R alongside an R/ folder (14 .R files) and a data/ ",
-         "folder. If R/ is absent, the upload dropped nested directories -- ",
-         "re-upload the R and data folders to the repository.")
-  }
-}
-
-# Source global.R FIRST -- it attaches every package. The rest of R/ runs
-# top-level code (constant tables built with tribble(), etc.) that needs
-# those packages already loaded. Sourcing the folder alphabetically would
-# put data_sources.R ahead of global.R and fail on a clean machine.
-source(file.path("R", "global.R"))
-rest <- setdiff(list.files("R", full.names = TRUE, pattern = "\\.R$"),
-                file.path("R", "global.R"))
-for (f in rest) source(f)
-
-app_password <- function() Sys.getenv("APP_PASSWORD", "")
-
-# ------------------------------------------------------------------------------
-# Main interface. navset_bar (not page_navbar) so it can be rendered *after*
-# login -- keeping athlete medical data off the page until authenticated.
-# ------------------------------------------------------------------------------
-app_body <- function() {
-  navset_bar(
-    title = span(icon("shield-halved"), " Life University Rugby"),
-    # fillable = FALSE is essential: with fill behaviour on, every card and
+ial: with fill behaviour on, every card and
     # plot is compressed to share one viewport height instead of taking the
     # height it asks for, and the page collapses into an unreadable strip.
     fillable = FALSE,
@@ -140,8 +81,16 @@ server <- function(input, output, session) {
 
   # Everything below is initialised ONCE, after login: modules populate their
   # dropdowns on startup, so they must not run before their UI exists.
-  observeEvent(authed(), {
-    req(authed())
+  #
+  # NB: a plain observeEvent(authed(), ..., once = TRUE) is a trap here. It
+  # fires on the initial value too -- FALSE whenever a password is set -- and
+  # `once` then destroys the observer before login ever happens, leaving every
+  # output blank. An explicit latch is unambiguous.
+  modules_started <- reactiveVal(FALSE)
+
+  observe({
+    req(authed(), !modules_started())
+    modules_started(TRUE)
 
     # Single load at startup; refreshes every 15 min for live deployments.
     app_data <- reactive({
@@ -182,7 +131,7 @@ server <- function(input, output, session) {
           lbl(live["gps"], "GPS"), lbl(live["wellness"], "Wellness"),
           lbl(live["testing"], "Testing"))
     })
-  }, once = TRUE)
+  })
 }
 
 shinyApp(ui, server)
