@@ -1,0 +1,21 @@
+# NEVER commit credentials -------------------------------------------------
+# A service-account key is a live password to your Google account.
+*.json
+!manifest.json
+.secrets/
+.gs4-cache/
+data/.gs4-cache/
+.Renviron
+.Rprofile
+
+# Local data that the app regenerates or that lives in Google Sheets
+data/availability.csv
+data/sessions.csv
+
+# R / RStudio cruft
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+rsconnect/
+*.Rproj
