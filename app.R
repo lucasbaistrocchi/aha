@@ -26,13 +26,27 @@ if (!file.exists(file.path("R", "global.R"))) {
     setwd(hit[1])   # also makes data/ paths (roster, workbook) resolve
     message("app.R: switched working directory to ", normalizePath(getwd()))
   } else {
-    stop("Cannot find R/global.R from '", normalizePath(getwd()),
-         "'. Deploy with app.R and the R/ folder at the same level.")
+    # List what IS here -- a missing R/ folder is almost always an upload
+    # that dropped nested directories, and seeing the actual contents
+    # settles it immediately instead of guessing from the logs.
+    here <- sort(list.files(".", all.files = TRUE, no.. = TRUE))
+    stop("Cannot find R/global.R from '", normalizePath(getwd()), "'.\n",
+         "Contents of that directory: ",
+         if (length(here)) paste(here, collapse = ", ") else "(empty)", "\n",
+         "Expected app.R alongside an R/ folder (14 .R files) and a data/ ",
+         "folder. If R/ is absent, the upload dropped nested directories -- ",
+         "re-upload the R and data folders to the repository.")
   }
 }
 
-# Source global config, data layer, metrics, and all modules.
-for (f in list.files("R", full.names = TRUE, pattern = "\\.R$")) source(f)
+# Source global.R FIRST -- it attaches every package. The rest of R/ runs
+# top-level code (constant tables built with tribble(), etc.) that needs
+# those packages already loaded. Sourcing the folder alphabetically would
+# put data_sources.R ahead of global.R and fail on a clean machine.
+source(file.path("R", "global.R"))
+rest <- setdiff(list.files("R", full.names = TRUE, pattern = "\\.R$"),
+                file.path("R", "global.R"))
+for (f in rest) source(f)
 
 app_password <- function() Sys.getenv("APP_PASSWORD", "")
 
