@@ -10,6 +10,27 @@
 #   CATAPULT_API_TOKEN        optional; switches GPS to the OpenField API
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
+# Locate the app directory before anything else.
+# A hosted deploy can start the R process at the REPOSITORY ROOT rather than
+# the folder holding app.R (e.g. when the repo keeps everything inside a
+# rugby-ams/ subfolder). If that happens, "R/" and "data/" resolve to nothing:
+# no packages load, no modules exist, and the first error you see is a
+# baffling `could not find function "page_fluid"`. So: find R/global.R, move
+# there, and fail loudly with a useful message if it genuinely isn't present.
+# ------------------------------------------------------------------------------
+if (!file.exists(file.path("R", "global.R"))) {
+  subdirs <- list.dirs(".", recursive = FALSE)
+  hit <- subdirs[file.exists(file.path(subdirs, "R", "global.R"))]
+  if (length(hit) >= 1) {
+    setwd(hit[1])   # also makes data/ paths (roster, workbook) resolve
+    message("app.R: switched working directory to ", normalizePath(getwd()))
+  } else {
+    stop("Cannot find R/global.R from '", normalizePath(getwd()),
+         "'. Deploy with app.R and the R/ folder at the same level.")
+  }
+}
+
 # Source global config, data layer, metrics, and all modules.
 for (f in list.files("R", full.names = TRUE, pattern = "\\.R$")) source(f)
 
