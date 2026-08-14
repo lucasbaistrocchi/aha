@@ -132,7 +132,11 @@ fetch_catapult_sessions <- function(start_date, end_date) {
 # Position (Back/Forward) | Acceleration/Deceleration Efforts | Mins Played |
 # Duration (h:mm:ss) | Distance | Player Load | Max Velocity (m/s) |
 # Max Vel (% Max) | High Metabolic Load Distance | Running/HI/Sprint Distance |
-# High Speed Distance (= HI + Sprint) | Impacts | ... plus per-minute rates.
+# HSR | Impacts | ... plus per-minute rates.
+#
+# HSR: read from the sheet's own "HSR" column. An older "High Speed Distance"
+# column may still be present -- it was miscalculated and is ignored unless
+# no HSR column exists at all.
 #
 # Mapping notes:
 # * Rich feed: PlayerLoad, HMLD, REAL minutes played, and Impacts (mapped to
@@ -196,6 +200,12 @@ fetch_gps_sheet <- function() {
 
   num <- function(x) suppressWarnings(as.numeric(as.character(x)))
 
+  # HSR comes from the sheet's dedicated "HSR" column. The older
+  # "High Speed Distance" column is still present but was computing the wrong
+  # thing, so it is only a fallback for sheets that predate the HSR column.
+  if (!"HSR" %in% names(raw) && "High Speed Distance" %in% names(raw))
+    raw[["HSR"]] <- raw[["High Speed Distance"]]
+
   # "1:19:20" (h:mm:ss) or "41:14" (mm:ss) -> minutes.
   dur_to_min <- function(x) {
     vapply(strsplit(as.character(x), ":"), function(p) {
@@ -222,7 +232,7 @@ fetch_gps_sheet <- function() {
       maxvel_raw   = matches("^Max Velocity"),
       pctmax_raw   = matches("Max Vel \\(% Max\\)"),
       hmld_raw     = matches("^High Metabolic Load Distance$"),
-      hsd_raw      = matches("^High Speed Distance$"),
+      hsr_raw      = matches("^HSR$"),
       sprint_raw   = matches("^Sprint Distance$"),
       impacts_raw  = matches("^Impacts$")
     ) |>
@@ -244,7 +254,7 @@ fetch_gps_sheet <- function() {
       match_minutes = if_else(session_type == "match", mins, NA_real_),
       duration_min = coalesce(dur_to_min(duration_raw), mins),
       distance     = num(dist_raw),
-      hsr_distance = num(hsd_raw),      # High Speed = HI + Sprint bands
+      hsr_distance = num(hsr_raw),      # the sheet's HSR column
       sprint_distance = num(sprint_raw),
       accels  = num(accel_raw),
       decels  = num(decel_raw),
