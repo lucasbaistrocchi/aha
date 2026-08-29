@@ -26,6 +26,15 @@ mod_longitudinal_ui <- function(id) {
       )
     ),
     card(
+      card_header(uiOutput(ns("weekly_header"))),
+      p(class = "text-muted small mb-1",
+        "Monday-Sunday weeks, all sessions (training + match day).
+         Change is measured against the immediately preceding week only —
+         a dash means the previous week has no data, so no honest
+         comparison exists."),
+      reactableOutput(ns("athlete_weekly"))
+    ),
+    card(
       card_header("Week-over-week load progression (squad)"),
       reactableOutput(ns("wow_table"))
     )
@@ -79,6 +88,61 @@ mod_longitudinal_server <- function(id, data) {
         ams_plotly_layout(paste("ACWR —", input$athlete),
                           hovermode = "x unified", margin_b = 90,
                           margin_l = 64)
+    })
+
+    # --- Weekly breakdown for the selected athlete ---------------------------
+    output$weekly_header <- renderUI({
+      span(paste0("Weekly breakdown",
+                  if (!is.null(input$athlete) && nzchar(input$athlete))
+                    paste0(" — ", input$athlete) else ""))
+    })
+
+    output$athlete_weekly <- renderReactable({
+      req(input$athlete)
+      w <- compute_athlete_weekly(data()$gps, input$athlete)
+      validate(need(nrow(w) > 0, "No sessions recorded for this athlete."))
+
+      tbl <- w |>
+        arrange(desc(week)) |>
+        transmute(
+          Week = format(week, "%b %d"),
+          Sessions = sessions,
+          `TD (m)` = round(td),          `TD Δ` = d_td,
+          `HSR (m)` = round(hsr),        `HSR Δ` = d_hsr,
+          `A+D` = round(ad),             `A+D Δ` = d_ad,
+          `HMLD (m)` = round(hmld),      `HMLD Δ` = d_hmld
+        )
+      if (!isTRUE(data()$has_hmld))
+        tbl <- select(tbl, -`HMLD (m)`, -`HMLD Δ`)
+
+      # Spikes above the pre-season threshold read red; sharp drops of the
+      # same size read gold (de-training / missed week is also worth seeing).
+      lim <- THRESHOLDS$wow_jump_pct * 100
+      delta_col <- colDef(
+        cell = function(value) {
+          if (is.na(value)) "—" else sprintf("%+.0f%%", value)
+        },
+        style = function(value) {
+          if (is.na(value)) return(list(color = AMS_COLORS$grey))
+          col <- if (value > lim) AMS_COLORS$red
+                 else if (value < -lim) AMS_COLORS$gold
+                 else AMS_COLORS$primary
+          list(color = col, fontWeight = 700)
+        },
+        width = 84)
+
+      cols <- list(
+        Week = colDef(width = 88, style = list(fontWeight = 700)),
+        Sessions = colDef(width = 84),
+        `TD Δ` = delta_col, `HSR Δ` = delta_col,
+        `A+D Δ` = delta_col, `HMLD Δ` = delta_col
+      )
+      reactable(
+        tbl, compact = TRUE, striped = TRUE, defaultPageSize = 12,
+        defaultColDef = colDef(format = colFormat(separators = TRUE)),
+        columns = cols[names(cols) %in% names(tbl)],
+        theme = ams_react_theme
+      )
     })
 
     output$wow_table <- renderReactable({

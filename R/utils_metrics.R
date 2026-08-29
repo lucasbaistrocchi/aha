@@ -204,6 +204,50 @@ compute_group_progress <- function(gps, week_no = 1) {
 }
 
 # ------------------------------------------------------------------------------
+# 3b-ii. PER-ATHLETE WEEKLY BREAKDOWN
+# ------------------------------------------------------------------------------
+# Weekly totals for the load-budget metrics (TD, HSR, A+D, HMLD) plus
+# week-over-week % change, for one athlete. Weeks are Monday-Sunday, matching
+# the rest of the app. ALL activity tags count -- training and match day.
+#
+# Change is only computed against the IMMEDIATELY PRECEDING calendar week.
+# The season has real gaps (e.g. April matches, then pre-season in August);
+# comparing across a three-month break would manufacture a meaningless
+# "+400%". Non-adjacent weeks return NA and display as "-".
+compute_athlete_weekly <- function(gps, athlete) {
+  d <- gps |> filter(athlete_name == athlete)
+  if (nrow(d) == 0)
+    return(tibble(week = as_date(character()), sessions = integer(),
+                  td = numeric(), hsr = numeric(), ad = numeric(),
+                  hmld = numeric(), d_td = numeric(), d_hsr = numeric(),
+                  d_ad = numeric(), d_hmld = numeric()))
+
+  pct_chg <- function(x, adjacent) {
+    prev <- lag(x)
+    if_else(adjacent & !is.na(prev) & prev > 0,
+            100 * (x - prev) / prev, NA_real_)
+  }
+
+  d |>
+    mutate(week = floor_date(date, "week", week_start = 1)) |>
+    group_by(week) |>
+    summarise(
+      sessions = n(),
+      td   = sum(distance, na.rm = TRUE),
+      hsr  = sum(hsr_distance, na.rm = TRUE),
+      ad   = sum(accels, na.rm = TRUE) + sum(decels, na.rm = TRUE),
+      hmld = sum(hmld, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(week) |>
+    mutate(adjacent = !is.na(lag(week)) &
+             as.numeric(week - lag(week)) == 7) |>
+    mutate(across(c(td, hsr, ad, hmld),
+                  ~ pct_chg(.x, adjacent), .names = "d_{.col}")) |>
+    select(-adjacent)
+}
+
+# ------------------------------------------------------------------------------
 # 3c. LONGITUDINAL MATCH EXPOSURE (last N matches)
 # ------------------------------------------------------------------------------
 # Chronic match exposure separates two very different athletes who look alike
