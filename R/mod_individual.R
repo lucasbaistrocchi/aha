@@ -33,7 +33,8 @@ mod_individual_ui <- function(id) {
                 theme = "primary", class = "vb-compact"),
       value_box(title = "Total Minutes", value = textOutput(ns("vb_mins")),
                 theme = "secondary", class = "vb-compact"),
-      value_box(title = "Top Speed (m/s)", value = textOutput(ns("vb_vmax")),
+      value_box(title = "Top Speed (m/s) — best logged",
+                value = textOutput(ns("vb_vmax")),
                 theme = "success", class = "vb-compact")
     ),
     layout_columns(
@@ -97,10 +98,18 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
     ath_info <- reactive({
       g <- ath_gps()
       req(nrow(g) > 0)
+      # vmax is already the best logged session speed (see derive_vmax);
+      # tested is the roster's combine figure, kept only for comparison.
+      vt <- if ("vmax_tested" %in% names(g))
+        suppressWarnings(max(g$vmax_tested, na.rm = TRUE)) else NA_real_
       list(name = input$athlete,
            cohort = g$position_group[1],
            vmax = suppressWarnings(max(g$vmax, na.rm = TRUE)),
-           best_obs = suppressWarnings(max(g$max_vel, na.rm = TRUE)))
+           vmax_tested = if (is.finite(vt)) vt else NA_real_,
+           best_date = {
+             ok <- is.finite(g$max_vel) & g$max_vel > 0
+             if (any(ok)) g$date[ok][which.max(g$max_vel[ok])] else NA
+           })
     })
 
     # --- Header ---------------------------------------------------------------
@@ -113,6 +122,12 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
                             if (dark) "#0A0A0A" else "white"), txt)
       tagList(
         chip(AMS_COLORS$primary, info$cohort),
+        if (is.finite(info$vmax) && !is.na(info$best_date))
+          chip(AMS_COLORS$grey,
+               paste("PB", format(info$best_date, "%b %d")), FALSE),
+        if (is.finite(info$vmax_tested))
+          chip(AMS_COLORS$grey,
+               sprintf("tested %.2f", info$vmax_tested), FALSE),
         if (nrow(v) == 1) {
           st <- as.character(v$status)
           chip(switch(st, Green = AMS_COLORS$green,
