@@ -166,25 +166,33 @@ preseason_week_window <- function(week_no) {
 # has a low weekly total for reasons of availability, not prescription --
 # leaving them in the cohort aggregate drags the group's apparent completion
 # down and makes a well-loaded unit look under-done.
-compute_attendance <- function(gps, win) {
+compute_attendance <- function(gps, win, min_share = NULL) {
+  # Default pulled at call time, with a literal fallback: a stale global.R on
+  # a deployment must not take the whole Weekly Load / Home briefing down.
+  if (is.null(min_share))
+    min_share <- if (exists("ATTENDANCE_MIN")) ATTENDANCE_MIN else 0.70
+
   week_gps <- gps |> filter(date >= win[1], date <= win[2])
-  n_dates <- n_distinct(week_gps$date)
-  roster <- gps |> distinct(athlete_id, athlete_name, position_group)
+  n_dates  <- as.integer(n_distinct(week_gps$date))
+  roster   <- gps |> distinct(athlete_id, athlete_name, position_group)
 
   attended <- week_gps |>
     group_by(athlete_id) |>
     summarise(sessions_attended = n_distinct(date), .groups = "drop")
 
-  roster |>
+  out <- roster |>
     left_join(attended, by = "athlete_id") |>
-    mutate(
-      sessions_attended = coalesce(sessions_attended, 0L),
-      sessions_possible = n_dates,
-      attendance = if_else(n_dates > 0,
-                           sessions_attended / n_dates, NA_real_),
-      meets_attendance = !is.na(attendance) &
-        attendance > ATTENDANCE_MIN
-    )
+    mutate(sessions_attended = coalesce(as.integer(sessions_attended), 0L),
+           sessions_possible = n_dates)
+
+  # Plain assignment rather than if_else(): the condition here is a single
+  # scalar while the columns are one-per-athlete, and older dplyr refuses to
+  # recycle a length-1 condition against a length-n value.
+  out$attendance <- if (n_dates > 0) out$sessions_attended / n_dates
+                    else NA_real_
+  out$meets_attendance <- !is.na(out$attendance) &
+    out$attendance > min_share
+  out
 }
 
 # `include_all = TRUE` ignores the attendance filter (used by views that
@@ -195,7 +203,12 @@ compute_group_progress <- function(gps, week_no = 1, include_all = FALSE) {
   win  <- preseason_week_window(week_no)
 
   att <- compute_attendance(gps, win)
-  keep <- if (include_all) att$athlete_id
+  n_dates <- if (nrow(att)) att$sessions_possible[1] else 0L
+
+  # A week with no sessions logged yet (the usual state early in the week)
+  # would fail every athlete's attendance test and empty the whole table.
+  # In that case count everyone, so cohorts still show 0% against forecast.
+  keep <- if (include_all || n_dates == 0) att$athlete_id
           else att$athlete_id[att$meets_attendance]
 
   week_gps <- gps |>
