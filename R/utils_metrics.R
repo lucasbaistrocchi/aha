@@ -161,16 +161,55 @@ preseason_week_window <- function(week_no) {
   c(start, start + 6)
 }
 
-compute_group_progress <- function(gps, week_no = 1) {
+# Attendance for one week: sessions an athlete appears in, over the number of
+# session dates the squad ran that week. An athlete who missed half the week
+# has a low weekly total for reasons of availability, not prescription --
+# leaving them in the cohort aggregate drags the group's apparent completion
+# down and makes a well-loaded unit look under-done.
+compute_attendance <- function(gps, win) {
+  week_gps <- gps |> filter(date >= win[1], date <= win[2])
+  n_dates <- n_distinct(week_gps$date)
+  roster <- gps |> distinct(athlete_id, athlete_name, position_group)
+
+  attended <- week_gps |>
+    group_by(athlete_id) |>
+    summarise(sessions_attended = n_distinct(date), .groups = "drop")
+
+  roster |>
+    left_join(attended, by = "athlete_id") |>
+    mutate(
+      sessions_attended = coalesce(sessions_attended, 0L),
+      sessions_possible = n_dates,
+      attendance = if_else(n_dates > 0,
+                           sessions_attended / n_dates, NA_real_),
+      meets_attendance = !is.na(attendance) &
+        attendance > ATTENDANCE_MIN
+    )
+}
+
+# `include_all = TRUE` ignores the attendance filter (used by views that
+# should show the whole squad regardless).
+compute_group_progress <- function(gps, week_no = 1, include_all = FALSE) {
   week_no <- max(1, min(week_no, length(WEEK_MULTIPLIERS)))
   mult <- WEEK_MULTIPLIERS[week_no]
   win  <- preseason_week_window(week_no)
 
-  week_gps <- gps |> filter(date >= win[1], date <= win[2])
+  att <- compute_attendance(gps, win)
+  keep <- if (include_all) att$athlete_id
+          else att$athlete_id[att$meets_attendance]
 
-  athlete_counts <- gps |>
-    distinct(athlete_id, position_group) |>
+  week_gps <- gps |>
+    filter(date >= win[1], date <= win[2], athlete_id %in% keep)
+
+  # Targets scale to the athletes actually counted, so the cohort's
+  # forecast and its accumulated load describe the same group of players.
+  athlete_counts <- att |>
+    filter(athlete_id %in% keep) |>
     count(position_group, name = "n_athletes")
+
+  excluded_counts <- att |>
+    filter(!athlete_id %in% keep) |>
+    count(position_group, name = "n_excluded")
 
   week_gps |>
     group_by(position_group) |>
@@ -181,9 +220,11 @@ compute_group_progress <- function(gps, week_no = 1) {
               acc_hmld     = sum(hmld, na.rm = TRUE),
               .groups = "drop") |>
     right_join(athlete_counts, by = "position_group") |>
+    left_join(excluded_counts, by = "position_group") |>
     left_join(MATCH_BENCHMARKS, by = "position_group") |>
     mutate(
       across(starts_with("acc_"), ~ coalesce(.x, 0)),
+      n_excluded = coalesce(n_excluded, 0L),
       tg_distance = bm_distance * mult * n_athletes,
       tg_hsr      = bm_hsr      * mult * n_athletes,
       tg_ad       = bm_ad       * mult * n_athletes,
@@ -237,6 +278,71 @@ compute_athlete_weekly <- function(gps, athlete) {
       hsr  = sum(hsr_distance, na.rm = TRUE),
       ad   = sum(accels, na.rm = TRUE) + sum(decels, na.rm = TRUE),
       hmld = sum(hmld, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(week) |>
+    mutate(adjacent = !is.na(lag(week)) &
+             as.numeric(week - lag(week)) == 7) |>
+    mutate(across(c(td, hsr, ad, hmld),
+                  ~ pct_chg(.x, adjacent), .names = "d_{.col}")) |>
+    select(-adjacent)
+}
+
+# ------------------------------------------------------------------------------
+# 3b-iii. COHORT VIEWS (same shapes as the individual ones)
+# ------------------------------------------------------------------------------
+# Cohort figures are PER-ATHLETE AVERAGES, not cohort sums: divided by the
+# cohort's roster size (a fixed denominator), so the numbers sit on the same
+# scale as an individual athlete's and don't swing with squad availability.
+cohort_daily_load <- function(gps, cohort, load_col = "player_load") {
+  d <- gps |> filter(position_group == cohort)
+  if (nrow(d) == 0) return(NULL)
+  n_ath <- n_distinct(d$athlete_id)
+
+  all_days <- seq(min(d$date), max(d$date), by = "day")
+  d |>
+    group_by(date) |>
+    summarise(daily_load = sum(.data[[load_col]], na.rm = TRUE) / n_ath,
+              .groups = "drop") |>
+    complete(date = all_days, fill = list(daily_load = 0)) |>
+    arrange(date)
+}
+
+# ACWR for a whole cohort, matching compute_acwr()'s output columns.
+compute_cohort_acwr <- function(gps, cohort, load_col = "player_load") {
+  series <- cohort_daily_load(gps, cohort, load_col)
+  if (is.null(series)) return(NULL)
+  series |>
+    mutate(
+      athlete_name   = cohort,
+      position_group = cohort,
+      acute   = ewma_vec(daily_load, 7),
+      chronic = ewma_vec(daily_load, 28),
+      acwr    = if_else(chronic > 0, acute / chronic, NA_real_)
+    )
+}
+
+# Weekly breakdown for a cohort, same columns as compute_athlete_weekly().
+compute_cohort_weekly <- function(gps, cohort) {
+  d <- gps |> filter(position_group == cohort)
+  if (nrow(d) == 0) return(compute_athlete_weekly(gps, "__none__"))
+  n_ath <- n_distinct(d$athlete_id)
+
+  pct_chg <- function(x, adjacent) {
+    prev <- lag(x)
+    if_else(adjacent & !is.na(prev) & prev > 0,
+            100 * (x - prev) / prev, NA_real_)
+  }
+
+  d |>
+    mutate(week = floor_date(date, "week", week_start = 1)) |>
+    group_by(week) |>
+    summarise(
+      sessions = n_distinct(date),
+      td   = sum(distance, na.rm = TRUE) / n_ath,
+      hsr  = sum(hsr_distance, na.rm = TRUE) / n_ath,
+      ad   = (sum(accels, na.rm = TRUE) + sum(decels, na.rm = TRUE)) / n_ath,
+      hmld = sum(hmld, na.rm = TRUE) / n_ath,
       .groups = "drop"
     ) |>
     arrange(week) |>
