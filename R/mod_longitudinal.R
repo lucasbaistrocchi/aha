@@ -9,8 +9,16 @@ mod_longitudinal_ui <- function(id) {
     layout_columns(
       col_widths = c(3, 9),
       card(
-        card_header("Controls"),
-        selectInput(ns("athlete"), "Athlete", choices = NULL),
+        card_header(
+          div(class = paste("d-flex justify-content-between",
+                            "align-items-center gap-2 flex-wrap"),
+              span("Controls"),
+              downloadButton(ns("export_pdf"), "PDF", class = "btn-sm"))
+        ),
+        # Cohorts and individuals share one selector: the same ACWR and
+        # weekly views work for either, so there's no reason to split them.
+        selectInput(ns("athlete"), "Athlete or position group",
+                    choices = NULL),
         selectInput(ns("load_metric"), "Load metric", choices = NULL),
         checkboxInput(ns("preseason"),
                       sprintf("Pre-season mode (flag >%d%% WoW jumps)",
@@ -45,8 +53,12 @@ mod_longitudinal_server <- function(id, data) {
   moduleServer(id, function(input, output, session) {
 
     observeEvent(data(), {
-      updateSelectInput(session, "athlete",
-                        choices = sort(unique(data()$gps$athlete_name)))
+      cohorts <- intersect(POSITION_GROUPS,
+                           unique(data()$gps$position_group))
+      extra <- setdiff(unique(data()$gps$position_group), POSITION_GROUPS)
+      updateSelectInput(session, "athlete", choices = list(
+        `Position groups` = c(cohorts, sort(extra)),
+        Athletes = sort(unique(data()$gps$athlete_name))))
       # Only offer load metrics the current GPS source actually reports.
       metrics <- c("PlayerLoad" = "player_load", "Distance (m)" = "distance",
                    "HSR (m)" = "hsr_distance", "HMLD (m)" = "hmld")
@@ -56,14 +68,24 @@ mod_longitudinal_server <- function(id, data) {
       updateSelectInput(session, "load_metric", choices = metrics)
     })
 
+    # Is the current selection a cohort or an individual?
+    is_cohort <- reactive({
+      req(input$athlete)
+      input$athlete %in% unique(data()$gps$position_group)
+    })
+
     acwr_data <- reactive({
       req(input$load_metric)
       compute_acwr(data()$gps, load_col = input$load_metric)
     })
 
     output$acwr_plot <- renderPlotly({
-      req(input$athlete)
-      d <- acwr_data() |> filter(athlete_name == input$athlete)
+      req(input$athlete, input$load_metric)
+      d <- if (is_cohort())
+        compute_cohort_acwr(data()$gps, input$athlete, input$load_metric)
+      else
+        acwr_data() |> filter(athlete_name == input$athlete)
+      validate(need(!is.null(d) && nrow(d) > 0, "No data for this selection."))
 
       plot_ly(d, x = ~date) |>
         # Sweet-spot band 0.8-1.5
@@ -85,22 +107,33 @@ mod_longitudinal_server <- function(id, data) {
           legend = list(orientation = "h", y = -0.16, yanchor = "top", x = 0),
           xaxis  = list(title = "", automargin = TRUE)
         ) |>
-        ams_plotly_layout(paste("ACWR —", input$athlete),
+        ams_plotly_layout(paste0("ACWR — ", input$athlete,
+                                 if (is_cohort())
+                                   " (per-athlete average)" else ""),
                           hovermode = "x unified", margin_b = 90,
                           margin_l = 64)
     })
 
     # --- Weekly breakdown for the selected athlete ---------------------------
+    weekly_data <- reactive({
+      req(input$athlete)
+      if (is_cohort()) compute_cohort_weekly(data()$gps, input$athlete)
+      else compute_athlete_weekly(data()$gps, input$athlete)
+    })
+
     output$weekly_header <- renderUI({
-      span(paste0("Weekly breakdown",
-                  if (!is.null(input$athlete) && nzchar(input$athlete))
-                    paste0(" — ", input$athlete) else ""))
+      div(class = "d-flex justify-content-between align-items-center gap-2",
+          span(paste0("Weekly breakdown",
+                      if (!is.null(input$athlete) && nzchar(input$athlete))
+                        paste0(" — ", input$athlete) else "")),
+          if (isTRUE(try(is_cohort(), silent = TRUE)))
+            span(class = "small", style = paste0("color:", AMS_COLORS$gold),
+                 "per-athlete averages"))
     })
 
     output$athlete_weekly <- renderReactable({
-      req(input$athlete)
-      w <- compute_athlete_weekly(data()$gps, input$athlete)
-      validate(need(nrow(w) > 0, "No sessions recorded for this athlete."))
+      w <- weekly_data()
+      validate(need(nrow(w) > 0, "No sessions recorded for this selection."))
 
       tbl <- w |>
         arrange(desc(week)) |>
@@ -144,6 +177,76 @@ mod_longitudinal_server <- function(id, data) {
         theme = ams_react_theme
       )
     })
+
+    # --- PDF export: weekly breakdown for the current selection -------------
+    output$export_pdf <- downloadHandler(
+      filename = function()
+        paste0("longitudinal-",
+               gsub("[^A-Za-z0-9]+", "-", input$athlete %||% "selection"),
+               "-", Sys.Date(), ".pdf"),
+      content = function(file) {
+        w <- weekly_data()
+        has_h <- isTRUE(data()$has_hmld)
+        acwr_now <- tryCatch({
+          a <- if (is_cohort())
+            compute_cohort_acwr(data()$gps, input$athlete, input$load_metric)
+          else acwr_data() |> filter(athlete_name == input$athlete)
+          a <- a |> filter(!is.na(acwr))
+          if (nrow(a)) tail(a$acwr, 1) else NA_real_
+        }, error = function(e) NA_real_)
+
+        num <- function(x) formatC(round(x), big.mark = ",", format = "d")
+        pct <- function(x) if (is.na(x)) "-" else sprintf("%+.0f%%", x)
+        lim <- THRESHOLDS$wow_jump_pct * 100
+
+        cols <- list(
+          list(label = "WEEK",  x = 0.00, align = "left"),
+          list(label = "SESS",  x = 0.15, align = "left"),
+          list(label = "TD (m)", x = 0.30, align = "right"),
+          list(label = "d%",    x = 0.38, align = "right"),
+          list(label = "HSR",   x = 0.52, align = "right"),
+          list(label = "d%",    x = 0.60, align = "right"),
+          list(label = "A+D",   x = 0.74, align = "right"),
+          list(label = "d%",    x = 0.82, align = "right"))
+        if (has_h) cols <- c(cols, list(
+          list(label = "HMLD", x = 0.94, align = "right")))
+
+        wd <- w |> arrange(desc(week))
+        rows <- lapply(seq_len(nrow(wd)), function(i) {
+          v <- c(format(wd$week[i], "%b %d"), as.character(wd$sessions[i]),
+                 num(wd$td[i]), pct(wd$d_td[i]),
+                 num(wd$hsr[i]), pct(wd$d_hsr[i]),
+                 num(wd$ad[i]), pct(wd$d_ad[i]))
+          if (has_h) v <- c(v, num(wd$hmld[i]))
+          v
+        })
+        # Delta columns keep the on-screen colour coding.
+        delta_j <- c(4, 6, 8)
+        delta_src <- list(`4` = "d_td", `6` = "d_hsr", `8` = "d_ad")
+        colour_fn <- function(i, j) {
+          if (!j %in% delta_j) return("#222222")
+          val <- wd[[delta_src[[as.character(j)]]]][i]
+          if (is.na(val)) return("#999999")
+          if (val > lim) "#C0392B" else if (val < -lim) "#B7950B"
+          else "#1E8449"
+        }
+
+        grDevices::pdf(file, width = 8.5, height = 11)
+        on.exit(grDevices::dev.off(), add = TRUE)
+        pdf_table(
+          title = paste0("Longitudinal — ", input$athlete),
+          subtitle = sprintf(
+            "%s | metric: %s | latest ACWR: %s | weeks Mon-Sun%s",
+            if (is_cohort()) "Position group (per-athlete averages)"
+              else "Individual athlete",
+            names(which(c("PlayerLoad" = "player_load",
+                          "Distance (m)" = "distance", "HSR (m)" = "hsr_distance",
+                          "HMLD (m)" = "hmld") == input$load_metric))[1] %||%
+              input$load_metric,
+            if (is.na(acwr_now)) "n/a" else sprintf("%.2f", acwr_now),
+            sprintf("  |  change flagged beyond +/-%.0f%%", lim)),
+          cols = cols, rows = rows, colour_fn = colour_fn)
+      })
 
     output$wow_table <- renderReactable({
       req(input$load_metric)
