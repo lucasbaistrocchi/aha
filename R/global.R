@@ -55,6 +55,12 @@ THRESHOLDS <- list(
   match_full_min  = 80      # rugby union match duration for MD benchmarks
 )
 
+# Minimum share of a week's sessions an athlete must attend before their load
+# counts toward the COHORT target aggregation. Partial attendance is an
+# availability story, not a prescription story; individual breakdowns still
+# show everyone.
+ATTENDANCE_MIN <- 0.70
+
 # ------------------------------------------------------------------------------
 # 2. RUGBY UNION POSITIONAL COHORTS & TARGETS (from the master database xlsx)
 # ------------------------------------------------------------------------------
@@ -355,6 +361,61 @@ status_colour <- function(s, print = FALSE) {
   if (!identical(s, "Full Participation"))
     return(if (print) "#B7950B" else AMS_COLORS$gold)
   if (print) "#1E8449" else AMS_COLORS$primary
+}
+
+# ------------------------------------------------------------------------------
+# PDF helpers (base graphics -- no pandoc / headless browser dependency)
+# ------------------------------------------------------------------------------
+# Base pdf() is ASCII territory: transliterate before drawing.
+pdf_ascii <- function(x) {
+  x <- gsub("≥", ">=", x); x <- gsub("≤", "<=", x)
+  x <- gsub("—", "-", x);  x <- gsub("–", "-", x)
+  x <- gsub("·", "|", x);  x <- gsub("Δ", "d", x)
+  iconv(x, to = "ASCII//TRANSLIT", sub = "")
+}
+
+# Draw a simple table on an open pdf() page, paginating as needed.
+# `cols` = named list(label, x, align) ; `rows` = list of character vectors.
+# `colour_fn(row_i, col_j)` optionally returns a colour per cell.
+pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
+                      row_h = 0.019) {
+  draw_head <- function() {
+    par(mar = c(0.4, 0.6, 0.4, 0.6))
+    plot.new(); plot.window(xlim = c(0, 1), ylim = c(0, 1))
+    y <- 0.98
+    text(0, y, pdf_ascii(title), adj = c(0, 1), cex = 1.3, font = 2)
+    y <- y - 0.026
+    if (nzchar(subtitle)) {
+      text(0, y, pdf_ascii(subtitle), adj = c(0, 1), cex = 0.88,
+           col = "#444444")
+      y <- y - 0.024
+    }
+    for (cl in cols)
+      text(cl$x, y, cl$label, adj = c(if (identical(cl$align, "right")) 1
+                                      else 0, 1),
+           cex = 0.72, font = 2, col = "#666666")
+    y <- y - 0.010
+    segments(0, y, 1, y, col = "#333333", lwd = 1.4)
+    y - 0.014
+  }
+
+  y <- draw_head()
+  for (i in seq_along(rows)) {
+    if (y < 0.04) y <- draw_head()
+    vals <- rows[[i]]
+    for (j in seq_along(cols)) {
+      cl <- cols[[j]]
+      col <- if (!is.null(colour_fn)) colour_fn(i, j) else "#222222"
+      text(cl$x, y, pdf_ascii(vals[j]),
+           adj = c(if (identical(cl$align, "right")) 1 else 0, 1),
+           cex = 0.76, col = col %||% "#222222")
+    }
+    y <- y - row_h
+    segments(0, y + 0.006, 1, y + 0.006, col = "#DDDDDD", lwd = 0.4)
+  }
+  text(0, 0.02, pdf_ascii(paste("Life University Rugby AMS  |  generated",
+                                format(Sys.Date(), "%b %d, %Y"))),
+       adj = c(0, 0), cex = 0.62, col = "#888888")
 }
 
 status_badge <- function(color, label) {
