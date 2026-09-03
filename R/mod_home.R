@@ -81,7 +81,11 @@ mod_home_server <- function(id, data, wellness_scored, vaccine, pre_week) {
 
     output$vb_distance <- renderText({
       gp <- group_progress()
-      sprintf("%.0f%%", 100 * sum(gp$acc_distance) / sum(gp$tg_distance))
+      tgt <- sum(gp$tg_distance, na.rm = TRUE)
+      # No cohorts or a zero target (week not started) -> show a dash rather
+      # than "NaN%".
+      if (nrow(gp) == 0 || !is.finite(tgt) || tgt <= 0) return("—")
+      sprintf("%.0f%%", 100 * sum(gp$acc_distance, na.rm = TRUE) / tgt)
     })
 
     output$vb_vaccine <- renderText({
@@ -134,6 +138,8 @@ mod_home_server <- function(id, data, wellness_scored, vaccine, pre_week) {
           `Forecast %` = pct_distance
         )
       if (!isTRUE(data()$has_hmld)) gp <- select(gp, -`HMLD rem (m)`)
+      validate(need(nrow(gp) > 0,
+                    "No sessions logged for this pre-season week yet."))
 
       reactable(
         gp, compact = TRUE, defaultPageSize = 6,
