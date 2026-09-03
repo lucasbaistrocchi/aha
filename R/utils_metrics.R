@@ -121,6 +121,10 @@ compute_wellness_scores <- function(wellness, window = 21) {
 compute_speed_vaccine <- function(gps, as_of = max(gps$date)) {
   gps |>
     filter(date <= as_of) |>
+    # Athletes with no valid recorded speed have no meaningful 90% target;
+    # including them would fabricate a threshold of zero that every session
+    # clears, painting them green. They are reported separately instead.
+    filter(!is.na(vmax), vmax > 0) |>
     group_by(athlete_id, athlete_name, position_group, vmax) |>
     summarise(
       last_exposure = suppressWarnings(
