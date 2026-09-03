@@ -1,515 +1,902 @@
 # ==============================================================================
-# utils_metrics.R -- Sport science computation engine
-# EWMA-ACWR, rolling wellness z-scores, readiness, speed vaccine status.
+# data_sources.R -- Catapult OpenField API + Google Sheets wellness ingestion
+#
+# DESIGN: every fetch_*() function first checks whether live credentials exist.
+# If not, it transparently falls back to generate_dummy_*() so the app runs
+# out-of-the-box. Live vs dummy is reported in the navbar so staff never
+# mistake demo data for real data.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. EWMA (Exponentially Weighted Moving Average)
+# 0. GOOGLE SHEETS AUTH
 # ------------------------------------------------------------------------------
-# Williams et al. (2017, BJSM) argue EWMA beats rolling averages for ACWR
-# because it weights recent load exponentially more -- the decay mirrors how
-# fitness/fatigue effects actually dissipate.
+# Reading link-shared sheets needs no login. WRITING (the availability board)
+# needs a service account -- a robot Google identity whose key travels with
+# the deployment, so no human ever has to click an OAuth prompt on a server.
 #
-#   lambda = 2 / (N + 1)          (N = chosen time constant in days)
-#   EWMA_t = load_t * lambda + EWMA_(t-1) * (1 - lambda)
-#
-# Acute uses N = 7 (lambda ~= 0.25), chronic N = 28 (lambda ~= 0.069).
-# ACWR = EWMA_acute / EWMA_chronic. Interpret as a *screening* flag, not a
-# deterministic injury predictor (per the post-2019 ACWR critiques) -- it
-# starts a conversation, it doesn't make the decision.
-ewma_vec <- function(x, n_days) {
-  lambda <- 2 / (n_days + 1)
-  out <- numeric(length(x))
-  if (length(x) == 0) return(out)
-  out[1] <- x[1]
-  for (i in seq_along(x)[-1]) {
-    out[i] <- x[i] * lambda + out[i - 1] * (1 - lambda)
+# Set GS4_SERVICE_ACCOUNT_JSON to EITHER the key file's path (local dev) or
+# the JSON text itself (Connect Cloud secret). Without it the app still runs:
+# reads work, and availability falls back to a local CSV.
+.sheet_auth <- new.env(parent = emptyenv())
+.sheet_auth$state <- NULL   # NULL = untried, TRUE = service acct, FALSE = anon
+
+ensure_sheet_auth <- function() {
+  if (!is.null(.sheet_auth$state)) return(.sheet_auth$state)
+
+  key <- Sys.getenv("GS4_SERVICE_ACCOUNT_JSON", "")
+  if (!nzchar(key)) {
+    gs4_deauth()
+    .sheet_auth$state <- FALSE
+    return(FALSE)
   }
-  out
+
+  path <- if (file.exists(key)) key else {
+    tmp <- tempfile(fileext = ".json")
+    writeLines(key, tmp)
+    tmp
+  }
+  ok <- tryCatch({
+    gs4_auth(path = path)
+    TRUE
+  }, error = function(e) {
+    warning("Service account auth failed, falling back to read-only: ",
+            conditionMessage(e))
+    gs4_deauth()
+    FALSE
+  })
+  .sheet_auth$state <- ok
+  ok
 }
 
-# Daily load series per athlete -> EWMA acute, chronic, ACWR.
-# `gps` must have: date, athlete_id, athlete_name, position_group + load col.
-compute_acwr <- function(gps, load_col = "player_load") {
-  all_days <- seq(min(gps$date), max(gps$date), by = "day")
+can_write_sheets <- function() isTRUE(ensure_sheet_auth())
 
-  gps |>
-    group_by(athlete_id, athlete_name, position_group, date) |>
-    summarise(daily_load = sum(.data[[load_col]], na.rm = TRUE),
-              .groups = "drop") |>
-    # Zero-fill non-training days: EWMA must decay through rest days,
-    # otherwise chronic load is overestimated.
-    complete(nesting(athlete_id, athlete_name, position_group),
-             date = all_days, fill = list(daily_load = 0)) |>
-    arrange(athlete_id, date) |>
-    group_by(athlete_id, athlete_name, position_group) |>
-    mutate(
-      acute   = ewma_vec(daily_load, 7),
-      chronic = ewma_vec(daily_load, 28),
-      acwr    = if_else(chronic > 0, acute / chronic, NA_real_)
-    ) |>
-    ungroup()
+# ------------------------------------------------------------------------------
+# 1. CATAPULT OPENFIELD CLOUD API (httr2)
+# ------------------------------------------------------------------------------
+# Auth  : long-lived API token passed as a Bearer header.
+#         Set once per machine:  Sys.setenv(CATAPULT_API_TOKEN = "xxx")
+#         or better, put it in ~/.Renviron.
+# Base  : region-specific. US = connect-us, EU = connect-eu, AU = connect-au.
+# Flow  : /activities (list sessions in a date window)  ->
+#         /activities/{id}/athletes/{id}/stats (per-athlete session stats)
+# Dates : OpenField expects UNIX epoch seconds for startTime/endTime params.
+CATAPULT_BASE <- Sys.getenv("CATAPULT_API_BASE",
+                            "https://connect-us.catapultsports.com/api/v6")
+
+catapult_token <- function() Sys.getenv("CATAPULT_API_TOKEN", "")
+
+has_catapult <- function() nzchar(catapult_token())
+
+catapult_req <- function(endpoint) {
+  request(CATAPULT_BASE) |>
+    req_url_path_append(endpoint) |>
+    req_auth_bearer_token(catapult_token()) |>
+    req_headers(Accept = "application/json") |>
+    req_retry(max_tries = 3, backoff = ~ 2) |>   # polite retry on 429/5xx
+    req_timeout(30)
 }
 
-# Week-over-week % change in total weekly load (pre-season ramp guardrail).
-# Progressive overload should live in the 5-15% band; >15% jumps are flagged.
-compute_wow_change <- function(gps, load_col = "distance") {
-  gps |>
-    mutate(week = floor_date(date, "week", week_start = 1)) |>
-    group_by(athlete_id, athlete_name, position_group, week) |>
-    summarise(weekly_load = sum(.data[[load_col]], na.rm = TRUE),
-              .groups = "drop") |>
-    arrange(athlete_id, week) |>
-    group_by(athlete_id) |>
-    mutate(
-      wow_pct = (weekly_load - lag(weekly_load)) / lag(weekly_load),
-      wow_flag = !is.na(wow_pct) & wow_pct > THRESHOLDS$wow_jump_pct
-    ) |>
-    ungroup()
+# Pull activities (sessions) in a window, then per-athlete stats for each.
+# Returns a tidy tibble: one row = one athlete-session.
+fetch_catapult_sessions <- function(start_date, end_date) {
+  # OpenField wants epoch seconds; lubridate makes the conversion explicit.
+  start_epoch <- as.integer(as_datetime(start_date))
+  end_epoch   <- as.integer(as_datetime(end_date) + days(1))
+
+  activities <- catapult_req("activities") |>
+    req_url_query(startTime = start_epoch, endTime = end_epoch) |>
+    req_perform() |>
+    resp_body_json(simplifyVector = TRUE)
+
+  if (length(activities) == 0) return(tibble())
+
+  # For each activity, request athlete stats. The `params` filter keeps the
+  # payload lean -- ask only for what the dashboard consumes.
+  wanted <- c("total_distance", "total_player_load", "max_vel",
+              "gen2_acceleration_band2plus_total_effort_count",   # accels >2.5
+              "gen2_deceleration_band2plus_total_effort_count",   # decels >2.5
+              "high_speed_distance",                              # >5.0 m/s zone
+              "metabolic_power_high_distance",                    # HMLD >25.5 W/kg
+              "field_time")
+
+  map_dfr(activities$id, function(aid) {
+    stats <- catapult_req(paste0("activities/", aid, "/athletes")) |>
+      req_url_query(params = paste(wanted, collapse = ",")) |>
+      req_perform() |>
+      resp_body_json(simplifyVector = TRUE)
+    as_tibble(stats) |> mutate(activity_id = aid)
+  }) |>
+    transmute(
+      date          = as_date(as_datetime(start_time %||% NA)),
+      athlete_id    = as.character(athlete_id),
+      athlete_name  = paste(first_name, last_name),
+      session_type  = tags %||% "training",
+      activity_tag  = tags %||% NA_character_,
+      opponent      = NA_character_,
+      distance      = total_distance,
+      hsr_distance  = high_speed_distance,
+      accels        = gen2_acceleration_band2plus_total_effort_count,
+      decels        = gen2_deceleration_band2plus_total_effort_count,
+      hmld          = metabolic_power_high_distance,
+      max_vel       = max_vel,
+      player_load   = total_player_load,
+      duration_min  = field_time / 60
+    )
 }
 
 # ------------------------------------------------------------------------------
-# 2. WELLNESS: composite readiness + rolling 21-day z-scores
+# 1b. GPS GOOGLE SHEET (primary GPS source until Catapult API goes live)
 # ------------------------------------------------------------------------------
-# Live Form schema: 1-10 scales with MIXED direction -- sleep quality & energy
-# "higher = better"; soreness & stress "higher = worse". Composite readiness
-# inverts the negative items (11 - x) so all four contribute in the same
-# direction, then rescales to %. Sleep quantity (hours) is displayed but kept
-# out of the composite: hours are a behaviour, the 1-10 items are perceptions.
+# Match report export, one row per player-match. Columns (matched by name
+# pattern, robust to reordering): Player Name | Date (ISO) | Opponent |
+# Position (Back/Forward) | Acceleration/Deceleration Efforts | Mins Played |
+# Duration (h:mm:ss) | Distance | Player Load | Max Velocity (m/s) |
+# Max Vel (% Max) | High Metabolic Load Distance | Running/HI/Sprint Distance |
+# HSR | Impacts | ... plus per-minute rates.
 #
-# Z-scores are computed WITHIN athlete against their own rolling 21-day
-# window: what matters is deviation from the athlete's own normal, not the
-# squad's (a stoic prop's 5 may be another athlete's 8).
-compute_wellness_scores <- function(wellness, window = 21) {
+# HSR: read from the sheet's own "HSR" column. An older "High Speed Distance"
+# column may still be present -- it was miscalculated and is ignored unless
+# no HSR column exists at all.
+#
+# Mapping notes:
+# * Rich feed: PlayerLoad, HMLD, REAL minutes played, and Impacts (mapped to
+#   contacts) are all present -- the app's full metric set lights up.
+# * Vmax: derived in load_all_data() as the best max velocity the athlete has
+#   recorded across logged sessions (see derive_vmax). The sheet's
+#   "Max Vel (% Max)" column is read but no longer sets vmax.
+# * Activity Tag drives session classification: "MD" = match day (the only
+#   rows the Match Day / Match Minutes tabs analyse); every other tag
+#   (e.g. "Pre-Season Day 0") is training. ALL tags feed weekly volume,
+#   ACWR, and longitudinal tracking.
+GPS_SHEET_DEFAULT <- "1VRHrsfxPC197OichZ7k7oMeaRiGzZV448wAs_QTWHt8"
 
-  roll_z <- function(x, w) {
-    # z of today's value vs the athlete's PRIOR w-day mean/sd (today excluded,
-    # so a bad day can't dilute its own reference distribution).
-    n <- length(x)
-    vapply(seq_len(n), function(i) {
-      lo <- max(1, i - w); ref <- x[lo:(i - 1)]
-      if (i < 8 || sd(ref, na.rm = TRUE) %in% c(0, NA)) return(NA_real_)
-      (x[i] - mean(ref, na.rm = TRUE)) / sd(ref, na.rm = TRUE)
+gps_sheet_id <- function() Sys.getenv("GPS_SHEET_ID", GPS_SHEET_DEFAULT)
+has_gps_sheet <- function() nzchar(gps_sheet_id())
+
+# Map the sheet's Position labels (any casing/spelling variant) to the six
+# rugby cohorts used across the app. Unrecognised labels fall back to the
+# coarse Forwards/Backs buckets so nothing ever drops out of the dashboards.
+map_position_to_cohort <- function(pos) {
+  p <- str_squish(str_to_lower(as.character(pos)))
+  case_when(
+    p %in% c("prop", "hooker")                              ~ "Front Row",
+    p %in% c("lock", "second row")                          ~ "Locks",
+    p %in% c("loose forward", "back row", "flanker",
+             "number 8", "no. 8", "no 8", "8th man")        ~ "Loose Forwards",
+    p %in% c("scrum-half", "scrumhalf", "scrum half",
+             "fly-half", "flyhalf", "fly half",
+             "half-back", "halfback")                       ~ "Half-Backs",
+    p %in% c("center", "centre", "midfield")                ~ "Midfield",
+    p %in% c("wing", "winger", "fullback", "full-back",
+             "full back", "back three")                     ~ "Back Three",
+    str_detect(p, "back")                                   ~ "Backs",
+    TRUE                                                    ~ "Forwards"
+  )
+}
+
+# Name spellings that differ between the GPS sheet and the official roster.
+# Canonical form = the roster spelling, so the override join lands.
+NAME_ALIASES <- c(
+  "Leo Keesler-Venables"   = "Leo Venables",
+  "Shaun Matthysen"        = "Shaun Matthyssen",
+  "Alai Uiasele"           = "Alai Uaisele",
+  "Dominic Gigliotti"      = "Dom Gigliotti",
+  "Nik Kehrer"             = "Nikolai Kehrer",
+  # Spellings unique to the availability sheet
+  "Aiden Gallant"          = "Aidan Gallant",
+  "Charlie Humphreys"      = "Charlie Humphries",
+  "Manuel Gonzales Deibe"  = "Manuel Gonzalez",
+  "Wyatt Appelton"         = "Wyatt Appleton"
+)
+
+canonical_name <- function(x) {
+  x <- str_squish(as.character(x))
+  ifelse(x %in% names(NAME_ALIASES), NAME_ALIASES[x], x)
+}
+
+fetch_gps_sheet <- function() {
+  ensure_sheet_auth()  # reads work anon or authed; never drop a service-account session
+  raw <- read_sheet(gps_sheet_id(), .name_repair = "unique")
+
+  num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+  # HSR comes from the sheet's dedicated "HSR" column. The older
+  # "High Speed Distance" column is still present but was computing the wrong
+  # thing, so it is only a fallback for sheets that predate the HSR column.
+  if (!"HSR" %in% names(raw) && "High Speed Distance" %in% names(raw))
+    raw[["HSR"]] <- raw[["High Speed Distance"]]
+
+  # "1:19:20" (h:mm:ss) or "41:14" (mm:ss) -> minutes.
+  dur_to_min <- function(x) {
+    vapply(strsplit(as.character(x), ":"), function(p) {
+      p <- suppressWarnings(as.numeric(p))
+      if (length(p) == 0 || all(is.na(p))) return(NA_real_)
+      p <- c(rep(0, max(0, 3 - length(p))), p)
+      p[1] * 60 + p[2] + p[3] / 60
     }, numeric(1))
   }
 
-  no_injury <- c("N/A", "n/a", "NA", "None", "none", "")
+  raw |>
+    rename(
+      athlete_raw  = matches("Player Name"),
+      date_raw     = matches("^Date"),
+      tag_raw      = matches("Activity Tag"),
+      opponent_raw = matches("Opponent"),
+      position_raw = matches("^Position"),
+      accel_raw    = matches("^Acceleration Efforts"),
+      decel_raw    = matches("^Deceleration Efforts"),
+      mins_raw     = matches("Mins Played"),
+      duration_raw = matches("^Duration"),
+      dist_raw     = matches("^Distance$"),
+      pl_raw       = matches("^Player Load$"),
+      maxvel_raw   = matches("^Max Velocity"),
+      pctmax_raw   = matches("Max Vel \\(% Max\\)"),
+      hmld_raw     = matches("^High Metabolic Load Distance$"),
+      hsr_raw      = matches("^HSR$"),
+      sprint_raw   = matches("^Sprint Distance$"),
+      impacts_raw  = matches("^Impacts$")
+    ) |>
+    filter(!is.na(athlete_raw), nzchar(as.character(athlete_raw))) |>
+    transmute(
+      date = as_date(as.character(date_raw)),
+      athlete_name = canonical_name(athlete_raw),
+      activity_tag = str_squish(as.character(tag_raw)),
+      opponent = as.character(opponent_raw),
+      position_group = map_position_to_cohort(position_raw),
+      # Activity Tag is authoritative: ONLY "MD" rows are match day. Every
+      # other tag (Pre-Season Day N, training, etc.) is training load --
+      # counted in weekly volume and ACWR, excluded from match analysis.
+      session_type = if_else(
+        !is.na(activity_tag) &
+          str_detect(activity_tag, regex("^md$|match", ignore_case = TRUE)),
+        "match", "training"),
+      mins = num(mins_raw),
+      match_minutes = if_else(session_type == "match", mins, NA_real_),
+      duration_min = coalesce(dur_to_min(duration_raw), mins),
+      distance     = num(dist_raw),
+      hsr_distance = num(hsr_raw),      # the sheet's HSR column
+      sprint_distance = num(sprint_raw),
+      accels  = num(accel_raw),
+      decels  = num(decel_raw),
+      max_vel = num(maxvel_raw),        # already m/s
+      pct_max = num(pctmax_raw),
+      player_load = num(pl_raw),
+      hmld = num(hmld_raw),
+      contacts = num(impacts_raw)       # Impacts as collision-load proxy
+    ) |>
+    select(-mins) |>
+    group_by(athlete_name) |>
+    mutate(
+      athlete_id = paste0("gps_", cur_group_id()),
+      # One cohort per athlete (modal position) so a player listed at two
+      # positions across matches doesn't split into two benchmark groups.
+      position_group = names(which.max(table(position_group)))
+    ) |>
+    ungroup() |>
+    select(-pct_max)
+    # vmax is NOT set here -- it is derived from observed max velocities in
+    # load_all_data(), so every source obeys the same rule.
+}
 
-  wellness |>
-    mutate(
-      readiness = (sleep_quality + energy +
-                     (11 - soreness) + (11 - stress)) / 40 * 100,
-      injury_flag = !is.na(aches) & !(trimws(aches) %in% no_injury)
-    ) |>
-    arrange(athlete_id, date) |>
+# Official roster override (data/roster.csv, generated from the roster
+# workbook): columns athlete_name, position, position_group, vmax.
+# The roster is authoritative for BOTH cohort and tested top speed --
+# tested Vmax beats an observed session max, which is only ever a floor.
+# Athletes in the GPS data but absent from the roster (e.g. departed
+# players) keep their sheet-derived values rather than dropping out.
+apply_roster_override <- function(gps) {
+  path <- "data/roster.csv"
+  if (!file.exists(path)) return(gps)
+  ov <- tryCatch(readr::read_csv(path, show_col_types = FALSE),
+                 error = function(e) NULL)
+  if (is.null(ov) || !"athlete_name" %in% names(ov)) return(gps)
+
+  # Keep only the override columns we know how to apply. The roster's tested
+  # speed is retained for reference as `vmax_tested` but does NOT set `vmax`:
+  # operational top speed comes from logged sessions (see derive_vmax).
+  ov <- ov |>
+    select(any_of(c("athlete_name", "position", "position_group", "vmax"))) |>
+    rename(any_of(c(vmax_tested = "vmax")))
+
+  out <- gps |>
+    left_join(ov, by = "athlete_name", suffix = c("", "_ov")) |>
+    mutate(on_roster = athlete_name %in% ov$athlete_name)
+
+  if ("position_group_ov" %in% names(out))
+    out <- out |> mutate(position_group = coalesce(position_group_ov,
+                                                   position_group))
+
+  out |> select(-ends_with("_ov"))
+}
+
+# ------------------------------------------------------------------------------
+# 1c. TOP SPEED FROM LOGGED SESSIONS
+# ------------------------------------------------------------------------------
+# vmax = the fastest max velocity an athlete has actually recorded in a logged
+# session. Applied to every GPS source so the rule is identical whatever the
+# feed, and it self-updates: the moment someone runs a new personal best that
+# session becomes their vmax, and the speed-vaccine threshold (90% of vmax)
+# rises with it.
+#
+# Zero / negative / missing speeds are ignored -- sessions where a unit didn't
+# record are logged as 0 in the sheet and must not be mistaken for a genuine
+# 0 m/s top speed. An athlete with no valid session yet gets vmax = NA rather
+# than 0, which would otherwise make "90% of vmax" a threshold of zero that
+# every session trivially clears.
+derive_vmax <- function(gps) {
+  if (!"max_vel" %in% names(gps)) return(gps)
+  gps |>
     group_by(athlete_id) |>
-    mutate(
-      readiness_z = roll_z(readiness, window),
-      z_flag      = !is.na(readiness_z) &
-                      readiness_z < THRESHOLDS$wellness_z_flag,
-      severe_sore = !is.na(soreness) &
-                      soreness >= THRESHOLDS$soreness_severe
-    ) |>
+    mutate(vmax = {
+      v <- max_vel[is.finite(max_vel) & max_vel > 0]
+      if (length(v) > 0) round(max(v), 2) else NA_real_
+    }) |>
     ungroup()
 }
 
 # ------------------------------------------------------------------------------
-# 3. SPEED VACCINE STATUS
+# 2. GOOGLE SHEETS WELLNESS (googlesheets4)
 # ------------------------------------------------------------------------------
-# For each athlete: days since last session where max_vel >= 90% of Vmax.
-# Green <=5 d | Yellow 6-7 d | Red >7 d (or never exposed in window).
-compute_speed_vaccine <- function(gps, as_of = max(gps$date)) {
-  gps |>
-    filter(date <= as_of) |>
-    # Athletes with no valid recorded speed have no meaningful 90% target;
-    # including them would fabricate a threshold of zero that every session
-    # clears, painting them green. They are reported separately instead.
-    filter(!is.na(vmax), vmax > 0) |>
-    group_by(athlete_id, athlete_name, position_group, vmax) |>
-    summarise(
-      last_exposure = suppressWarnings(
-        max(date[max_vel >= vmax * THRESHOLDS$vmax_pct], na.rm = TRUE)),
-      best_recent_pct = max(max_vel / vmax, na.rm = TRUE) * 100,
-      exposures_28d = sum(max_vel >= vmax * THRESHOLDS$vmax_pct &
-                            date > as_of - 28),
-      .groups = "drop"
+# Live source: team Google Form feeding the "WELLNESS" tab. Actual columns:
+#   Timestamp | Your Name | Sleep Quantity | Sleep Quality (1-10) |
+#   Energy Levels (1-10) | Soreness (1-10) | Stress (1-10) |
+#   Aches/Pains | Treatment Plan | ATC Notes | Please list how severe
+# Scale direction is MIXED: sleep quality & energy are "higher = better";
+# soreness & stress are "higher = worse". compute_wellness_scores() handles
+# the inversion -- keep raw values raw here (single source of truth).
+WELLNESS_SHEET_DEFAULT <- "1i5qT-r4uJuTU3qd6vQK1ZuF97KrBWxATCbER_a4RcMo"
+WELLNESS_TAB <- "WELLNESS"
+
+wellness_sheet_id <- function()
+  Sys.getenv("WELLNESS_SHEET_ID", WELLNESS_SHEET_DEFAULT)
+
+has_wellness_sheet <- function() nzchar(wellness_sheet_id())
+
+fetch_wellness <- function() {
+  ensure_sheet_auth()  # reads work anon or authed
+  raw <- read_sheet(wellness_sheet_id(), sheet = WELLNESS_TAB)
+
+  # Rename by pattern, not position -- survives column reordering in the Form.
+  raw |>
+    rename(
+      timestamp      = matches("Timestamp"),
+      athlete_name   = matches("Name"),
+      sleep_quantity = matches("Sleep Quantity"),
+      sleep_quality  = matches("Sleep Quality"),
+      energy         = matches("Energy"),
+      soreness       = matches("Soreness"),
+      stress         = matches("Stress"),
+      aches          = matches("Aches"),
+      treatment      = matches("Treatment"),
+      atc_notes      = matches("ATC"),
+      severity       = matches("severe")
     ) |>
     mutate(
-      last_exposure = as_date(if_else(is.infinite(last_exposure),
-                                      NA, last_exposure)),
-      days_since = as.numeric(as_of - last_exposure),
-      status = case_when(
-        is.na(days_since)                        ~ "Red",
-        days_since <= THRESHOLDS$vaccine_green   ~ "Green",
-        days_since <= THRESHOLDS$vaccine_yellow  ~ "Yellow",
-        TRUE                                     ~ "Red"
-      ),
-      status = factor(status, levels = c("Red", "Yellow", "Green"))
+      timestamp = if (inherits(timestamp, "POSIXt")) timestamp
+                  else mdy_hms(as.character(timestamp)),
+      date = as_date(timestamp),
+      # Sheets can hand back list-columns on mixed input; coerce defensively.
+      across(c(sleep_quantity, sleep_quality, energy, soreness, stress,
+               severity),
+             ~ suppressWarnings(as.numeric(as.character(.x)))),
+      across(c(athlete_name, aches, treatment, atc_notes), as.character)
     ) |>
-    arrange(status, desc(days_since))
+    # One row per athlete-day: keep the latest submission (form resubmits).
+    group_by(athlete_name, date) |>
+    slice_max(timestamp, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(date, athlete_name, sleep_quantity, sleep_quality, energy,
+           soreness, stress, aches, treatment, atc_notes, severity)
 }
 
 # ------------------------------------------------------------------------------
-# 3b. POSITIONAL WEEKLY PROGRESS vs PRE-SEASON FORECAST
+# 2c. PERFORMANCE TESTING GOOGLE SHEET
 # ------------------------------------------------------------------------------
-# Forecasted weekly load per cohort = Target Match Load x pre-season week
-# multiplier (both from the master database workbook; see global.R). Returns
-# one row per cohort with accumulated / forecast / remaining / pct for TD,
-# HSR, A+D (combined accel+decel efforts), and HMLD. Consumed by Weekly Load
-# AND Home briefing so both screens always agree.
-# Week windows are strict Monday-Sunday blocks counted from PRESEASON_START
-# (Mon 10 Aug 2026). ALL activity tags count toward accumulated volume --
-# match day and training alike.
-preseason_week_window <- function(week_no) {
-  start <- PRESEASON_START + (max(1, week_no) - 1) * 7
-  c(start, start + 6)
-}
+# One row per athlete per testing session. Wide format: Athlete Name | Team |
+# Position | anthropometry | CMJ (force-plate) | strength | IMTP columns.
+# An optional "Date" / "Test Date" column supports repeat testing sessions;
+# without it every row is treated as one session labelled "Current".
+# Returned LONG: athlete_name, test_date, metric, value.
+TESTING_SHEET_DEFAULT <- "1q3vOpuu2sudCZ44wB76YxvKWgoYX3xxr1oEwfYvk98Q"
 
-# Attendance for one week: sessions an athlete appears in, over the number of
-# session dates the squad ran that week. An athlete who missed half the week
-# has a low weekly total for reasons of availability, not prescription --
-# leaving them in the cohort aggregate drags the group's apparent completion
-# down and makes a well-loaded unit look under-done.
-compute_attendance <- function(gps, win, min_share = NULL) {
-  # Default pulled at call time, with a literal fallback: a stale global.R on
-  # a deployment must not take the whole Weekly Load / Home briefing down.
-  if (is.null(min_share))
-    min_share <- if (exists("ATTENDANCE_MIN")) ATTENDANCE_MIN else 0.70
+testing_sheet_id <- function()
+  Sys.getenv("TESTING_SHEET_ID", TESTING_SHEET_DEFAULT)
 
-  week_gps <- gps |> filter(date >= win[1], date <= win[2])
-  n_dates  <- as.integer(n_distinct(week_gps$date))
-  roster   <- gps |> distinct(athlete_id, athlete_name, position_group)
+# Metric catalogue: display grouping + direction. `higher_better = FALSE`
+# metrics (body fat, time-to-takeoff, time-to-peak-force) invert their
+# rankings and percentiles so "good" is always the top of the chart.
+# tibble:: qualified so this table builds even if the file is ever sourced
+# before global.R attaches the packages.
+TEST_METRICS <- tibble::tribble(
+  ~metric,                      ~group,           ~unit,  ~higher_better,
+  "Height (in)",                "Anthropometry",  "in",   TRUE,
+  "Weight",                     "Anthropometry",  "lbs",  TRUE,
+  "Lean Mass",                  "Anthropometry",  "lbs",  TRUE,
+  "Body Fat %",                 "Anthropometry",  "%",    FALSE,
+  "Chest (cm)",                 "Anthropometry",  "cm",   TRUE,
+  "Bicep (cm)",                 "Anthropometry",  "cm",   TRUE,
+  "Waist (cm)",                 "Anthropometry",  "cm",   FALSE,
+  "Hip (cm)",                   "Anthropometry",  "cm",   TRUE,
+  "Thigh (cm)",                 "Anthropometry",  "cm",   TRUE,
+  "Jump Height (m)",            "Jump / CMJ",     "m",    TRUE,
+  "Peak Braking Force (N)",     "Jump / CMJ",     "N",    TRUE,
+  "Peak Propulsive Force (N)",  "Jump / CMJ",     "N",    TRUE,
+  "Time To Takeoff",            "Jump / CMJ",     "s",    FALSE,
+  "Peak Landing Force (N)",     "Jump / CMJ",     "N",    TRUE,
+  "mRSI",                       "Jump / CMJ",     "",     TRUE,
+  "Back Squat 3RM (lbs)",       "Strength",       "lbs",  TRUE,
+  "Bench Press 3RM (lbs)",      "Strength",       "lbs",  TRUE,
+  "Chin Up 1RM (lbs)",          "Strength",       "lbs",  TRUE,
+  "SBJ (in)",                   "Power",          "in",   TRUE,
+  "IMTP Peak Force (N)",        "IMTP",           "N",    TRUE,
+  "Force at 100 ms (N)",        "IMTP",           "N",    TRUE,
+  "Force at 200 ms (N)",        "IMTP",           "N",    TRUE,
+  "Time to Peak Force (s)",     "IMTP",           "s",    FALSE,
+  # Speed & conditioning -- all timed, so faster (lower) is better.
+  # "Bronco (mm:ss)" is normalised to "Bronco" and converted to seconds.
+  "10 m (s)",                   "Speed",          "s",    FALSE,
+  "30 m (s)",                   "Speed",          "s",    FALSE,
+  "Bronco",                     "Conditioning",   "s",    FALSE,
+  "300mod #1 (s)",              "Conditioning",   "s",    FALSE,
+  "300mod #2 (s)",              "Conditioning",   "s",    FALSE
+)
 
-  attended <- week_gps |>
-    group_by(athlete_id) |>
-    summarise(sessions_attended = n_distinct(date), .groups = "drop")
+# Metrics shown on the Individual Report percentile chart, in display order
+# (top to bottom). A fixed set keeps reports comparable athlete to athlete.
+REPORT_METRICS <- tibble::tribble(
+  ~metric,                  ~label,
+  "Jump Height (m)",        "CMJ Jump Height",
+  "SBJ (in)",               "SBJ",
+  "Bronco",                 "Bronco",
+  "Back Squat 3RM (lbs)",   "Squat 3RM",
+  "Bench Press 3RM (lbs)",  "Bench 3RM",
+  "Chin Up 1RM (lbs)",      "Chin Up 1RM",
+  "IMTP Peak Force (N)",    "IMTP Peak Force",
+  "Body Fat %",             "Body Fat %"
+)
 
-  out <- roster |>
-    left_join(attended, by = "athlete_id") |>
-    mutate(sessions_attended = coalesce(as.integer(sessions_attended), 0L),
-           sessions_possible = n_dates)
+fetch_testing <- function() {
+  ensure_sheet_auth()  # reads work anon or authed
+  raw <- read_sheet(testing_sheet_id(), .name_repair = "unique")
+  names(raw) <- str_squish(names(raw))
 
-  # Plain assignment rather than if_else(): the condition here is a single
-  # scalar while the columns are one-per-athlete, and older dplyr refuses to
-  # recycle a length-1 condition against a length-n value.
-  out$attendance <- if (n_dates > 0) out$sessions_attended / n_dates
-                    else NA_real_
-  out$meets_attendance <- !is.na(out$attendance) &
-    out$attendance > min_share
+  name_col <- names(raw)[str_detect(names(raw),
+                                    regex("athlete|player", ignore_case = TRUE))][1]
+  if (is.na(name_col)) stop("No athlete name column in testing sheet")
+
+  date_col <- names(raw)[str_detect(names(raw),
+                                    regex("^(test )?date", ignore_case = TRUE))][1]
+
+  # Normalise any Bronco-ish column name ("Bronco Time", "Bronco (s)"...).
+  bronco_col <- names(raw)[str_detect(names(raw),
+                                      regex("bronco", ignore_case = TRUE))][1]
+  if (!is.na(bronco_col)) {
+    names(raw)[names(raw) == bronco_col] <- "Bronco"
+    # Bronco is often logged mm:ss -- convert to seconds so it ranks.
+    raw$Bronco <- vapply(as.character(raw$Bronco), function(v) {
+      v <- str_squish(v)
+      if (is.na(v) || !nzchar(v)) return(NA_real_)
+      if (str_detect(v, ":")) {
+        p <- suppressWarnings(as.numeric(strsplit(v, ":")[[1]]))
+        if (length(p) < 2 || anyNA(p)) return(NA_real_)
+        return(p[1] * 60 + p[2])
+      }
+      suppressWarnings(as.numeric(v))
+    }, numeric(1))
+  }
+
+  present <- intersect(TEST_METRICS$metric, names(raw))
+  if (length(present) == 0) stop("No recognised test metrics in testing sheet")
+
+  # Dates must be a real Date type, not text: "5/1/2026" and "10/1/2026"
+  # sort wrongly as strings, which would corrupt "latest session" logic.
+  parse_test_date <- function(d) {
+    if (inherits(d, "Date")) return(d)
+    if (inherits(d, "POSIXt")) return(as_date(d))
+    if (is.list(d)) d <- vapply(d, function(x)
+      if (length(x) == 0) NA_character_ else as.character(x[1]),
+      character(1))
+    s <- str_squish(as.character(d))
+    out <- suppressWarnings(mdy(s))                    # 5/1/2026
+    out[is.na(out)] <- suppressWarnings(ymd(s[is.na(out)]))   # 2026-05-01
+    out[is.na(out)] <- suppressWarnings(dmy(s[is.na(out)]))
+    out
+  }
+
+  out <- raw |>
+    mutate(
+      athlete_name = canonical_name(.data[[name_col]]),
+      test_date = if (!is.na(date_col)) parse_test_date(.data[[date_col]])
+                  else as_date(NA)
+    ) |>
+    filter(!is.na(athlete_name), nzchar(athlete_name)) |>
+    select(athlete_name, test_date, all_of(present)) |>
+    mutate(across(all_of(present),
+                  ~ suppressWarnings(as.numeric(as.character(.x))))) |>
+    pivot_longer(all_of(present), names_to = "metric", values_to = "value") |>
+    filter(!is.na(value))
+
+  # Columns that EXIST in the sheet, including ones with no results logged
+  # yet -- so a newly added test still appears in the Testing dropdown.
+  attr(out, "available_metrics") <- present
   out
 }
 
-# `include_all = TRUE` ignores the attendance filter (used by views that
-# should show the whole squad regardless).
-compute_group_progress <- function(gps, week_no = 1, include_all = FALSE) {
-  week_no <- max(1, min(week_no, length(WEEK_MULTIPLIERS)))
-  mult <- WEEK_MULTIPLIERS[week_no]
-  win  <- preseason_week_window(week_no)
-
-  att <- compute_attendance(gps, win)
-  n_dates <- if (nrow(att)) att$sessions_possible[1] else 0L
-
-  # A week with no sessions logged yet (the usual state early in the week)
-  # would fail every athlete's attendance test and empty the whole table.
-  # In that case count everyone, so cohorts still show 0% against forecast.
-  keep <- if (include_all || n_dates == 0) att$athlete_id
-          else att$athlete_id[att$meets_attendance]
-
-  week_gps <- gps |>
-    filter(date >= win[1], date <= win[2], athlete_id %in% keep)
-
-  # Targets scale to the athletes actually counted, so the cohort's
-  # forecast and its accumulated load describe the same group of players.
-  athlete_counts <- att |>
-    filter(athlete_id %in% keep) |>
-    count(position_group, name = "n_athletes")
-
-  excluded_counts <- att |>
-    filter(!athlete_id %in% keep) |>
-    count(position_group, name = "n_excluded")
-
-  week_gps |>
-    group_by(position_group) |>
-    summarise(acc_distance = sum(distance, na.rm = TRUE),
-              acc_hsr      = sum(hsr_distance, na.rm = TRUE),
-              acc_ad       = sum(accels, na.rm = TRUE) +
-                               sum(decels, na.rm = TRUE),
-              acc_hmld     = sum(hmld, na.rm = TRUE),
-              .groups = "drop") |>
-    right_join(athlete_counts, by = "position_group") |>
-    left_join(excluded_counts, by = "position_group") |>
-    left_join(MATCH_BENCHMARKS, by = "position_group") |>
-    mutate(
-      across(starts_with("acc_"), ~ coalesce(.x, 0)),
-      n_excluded = coalesce(n_excluded, 0L),
-      tg_distance = bm_distance * mult * n_athletes,
-      tg_hsr      = bm_hsr      * mult * n_athletes,
-      tg_ad       = bm_ad       * mult * n_athletes,
-      tg_hmld     = bm_hmld     * mult * n_athletes,
-      rem_distance = pmax(0, tg_distance - acc_distance),
-      rem_hsr      = pmax(0, tg_hsr - acc_hsr),
-      rem_ad       = pmax(0, tg_ad - acc_ad),
-      rem_hmld     = pmax(0, tg_hmld - acc_hmld),
-      pct_distance = 100 * acc_distance / tg_distance,
-      pct_hsr      = 100 * acc_hsr / tg_hsr,
-      pct_ad       = 100 * acc_ad / tg_ad,
-      pct_hmld     = 100 * acc_hmld / tg_hmld
-    ) |>
-    mutate(position_group = factor(
-      position_group,
-      levels = union(POSITION_GROUPS, unique(position_group)))) |>
-    arrange(position_group)
+# Human label for a testing session date (NA -> "Undated").
+test_date_label <- function(d) {
+  ifelse(is.na(d), "Undated", format(d, "%b %d, %Y"))
 }
 
 # ------------------------------------------------------------------------------
-# 3b-ii. PER-ATHLETE WEEKLY BREAKDOWN
+# 2d. AVAILABILITY BOARD (staff-maintained Google Sheet)
 # ------------------------------------------------------------------------------
-# Weekly totals for the load-budget metrics (TD, HSR, A+D, HMLD) plus
-# week-over-week % change, for one athlete. Weeks are Monday-Sunday, matching
-# the rest of the app. ALL activity tags count -- training and match day.
+# The board lives in a WIDE sheet the staff already fill in by hand:
+#   row 1:  Athlete Name | Team | 8/10 | (blank) | 8/11 | (blank) | ...
+#   rows 2+: one athlete per row
+# Each session date owns TWO columns: the status, then an unlabelled column
+# used for that day's ATC notes. Dates carry no year -- they belong to the
+# pre-season, so PRESEASON_START's year is applied.
 #
-# Change is only computed against the IMMEDIATELY PRECEDING calendar week.
-# The season has real gaps (e.g. April matches, then pre-season in August);
-# comparing across a three-month break would manufacture a meaningless
-# "+400%". Non-adjacent weeks return NA and display as "-".
-compute_athlete_weekly <- function(gps, athlete) {
-  d <- gps |> filter(athlete_name == athlete)
-  if (nrow(d) == 0)
-    return(tibble(week = as_date(character()), sessions = integer(),
-                  td = numeric(), hsr = numeric(), ad = numeric(),
-                  hmld = numeric(), d_td = numeric(), d_hsr = numeric(),
-                  d_ad = numeric(), d_hmld = numeric()))
+# The app reads this sheet as the source of truth and (with a service
+# account) writes edits back into the exact cells, leaving the layout and
+# every other date untouched.
+AVAILABILITY_SHEET_DEFAULT <- "1YVfYxPCgoFm-FLuvqn71fQFJMXyChWbGqOrn9Q_HTQs"
 
-  pct_chg <- function(x, adjacent) {
-    prev <- lag(x)
-    if_else(adjacent & !is.na(prev) & prev > 0,
-            100 * (x - prev) / prev, NA_real_)
+availability_sheet_id <- function()
+  Sys.getenv("AVAILABILITY_SHEET_ID", AVAILABILITY_SHEET_DEFAULT)
+
+# Spreadsheet column number -> letter (1=A, 27=AA, 40=AN).
+col_letter <- function(n) {
+  s <- ""
+  while (n > 0) {
+    r <- (n - 1) %% 26
+    s <- paste0(LETTERS[r + 1], s)
+    n <- (n - 1) %/% 26
+  }
+  s
+}
+
+empty_availability <- function() list(
+  board = tibble(athlete_name = character(), date = as_date(character()),
+                 status = character(), atc_notes = character()),
+  dates = as_date(character()),
+  cols  = integer(),
+  n_athletes = 0L,
+  athletes = character()
+)
+
+# Returns the long board plus the geometry needed to write back.
+read_availability_sheet <- function() {
+  ensure_sheet_auth()
+  raw <- tryCatch(
+    read_sheet(availability_sheet_id(), sheet = 1, col_names = FALSE,
+               col_types = "c"),
+    error = function(e) NULL)
+  if (is.null(raw) || nrow(raw) < 2) return(empty_availability())
+
+  hdr <- as.character(unlist(raw[1, ]))
+  # Date headers look like 8/10 or 08/10 (optionally with a year).
+  is_date_hdr <- !is.na(hdr) & str_detect(str_squish(hdr),
+                                          "^\\d{1,2}/\\d{1,2}(/\\d{2,4})?$")
+  date_cols <- which(is_date_hdr)
+  if (length(date_cols) == 0) return(empty_availability())
+
+  yr <- format(PRESEASON_START, "%Y")
+  parse_hdr <- function(h) {
+    h <- str_squish(h)
+    d <- suppressWarnings(mdy(if_else(str_count(h, "/") == 1,
+                                      paste0(h, "/", yr), h)))
+    d
+  }
+  dates <- parse_hdr(hdr[date_cols])
+
+  body <- raw[-1, , drop = FALSE]
+  names(body) <- paste0("V", seq_len(ncol(body)))
+  athletes <- canonical_name(body[[1]])
+  keep <- !is.na(athletes) & nzchar(str_squish(athletes))
+  body <- body[keep, , drop = FALSE]
+  athletes <- athletes[keep]
+
+  cell <- function(j) {
+    if (j > ncol(body)) return(rep(NA_character_, nrow(body)))
+    v <- as.character(body[[j]])
+    v[is.na(v)] <- ""
+    str_squish(v)
   }
 
-  d |>
-    mutate(week = floor_date(date, "week", week_start = 1)) |>
-    group_by(week) |>
-    summarise(
-      sessions = n(),
-      td   = sum(distance, na.rm = TRUE),
-      hsr  = sum(hsr_distance, na.rm = TRUE),
-      ad   = sum(accels, na.rm = TRUE) + sum(decels, na.rm = TRUE),
-      hmld = sum(hmld, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    arrange(week) |>
-    mutate(adjacent = !is.na(lag(week)) &
-             as.numeric(week - lag(week)) == 7) |>
-    mutate(across(c(td, hsr, ad, hmld),
-                  ~ pct_chg(.x, adjacent), .names = "d_{.col}")) |>
-    select(-adjacent)
+  board <- map_dfr(seq_along(date_cols), function(i) {
+    j <- date_cols[i]
+    tibble(athlete_name = athletes,
+           date = dates[i],
+           status = cell(j),
+           # The unlabelled column immediately after each date holds notes.
+           atc_notes = cell(j + 1))
+  }) |>
+    filter(!is.na(date))
+
+  list(board = board, dates = dates, cols = date_cols,
+       n_athletes = length(athletes), athletes = athletes)
+}
+
+# Write one date's statuses + notes back into their two columns, matching the
+# sheet's existing row order. Only those cells are touched.
+write_availability_day <- function(avail, day, status_vec, notes_vec) {
+  if (!can_write_sheets()) return(FALSE)
+  i <- which(avail$dates == day)
+  if (length(i) != 1) return(FALSE)
+
+  sc <- avail$cols[i]          # status column
+  nc <- sc + 1                 # paired notes column
+  n  <- avail$n_athletes
+  rng <- function(col) sprintf("%s2:%s%d", col_letter(col),
+                               col_letter(col), n + 1)
+
+  tryCatch({
+    range_write(availability_sheet_id(),
+                data = tibble(x = as.character(status_vec)),
+                sheet = 1, range = rng(sc),
+                col_names = FALSE, reformat = FALSE)
+    range_write(availability_sheet_id(),
+                data = tibble(x = as.character(notes_vec)),
+                sheet = 1, range = rng(nc),
+                col_names = FALSE, reformat = FALSE)
+    TRUE
+  }, error = function(e) {
+    warning("Availability write failed: ", conditionMessage(e))
+    FALSE
+  })
 }
 
 # ------------------------------------------------------------------------------
-# 3b-iii. COHORT VIEWS (same shapes as the individual ones)
+# 3. DUMMY DATA GENERATORS (deterministic seed -> reproducible demo)
 # ------------------------------------------------------------------------------
-# Cohort figures are PER-ATHLETE AVERAGES, not cohort sums: divided by the
-# cohort's roster size (a fixed denominator), so the numbers sit on the same
-# scale as an individual athlete's and don't swing with squad availability.
-cohort_daily_load <- function(gps, cohort, load_col = "player_load") {
-  d <- gps |> filter(position_group == cohort)
-  if (nrow(d) == 0) return(NULL)
-  n_ath <- n_distinct(d$athlete_id)
+DUMMY_SEED <- 42
 
-  all_days <- seq(min(d$date), max(d$date), by = "day")
-  d |>
-    group_by(date) |>
-    summarise(daily_load = sum(.data[[load_col]], na.rm = TRUE) / n_ath,
-              .groups = "drop") |>
-    complete(date = all_days, fill = list(daily_load = 0)) |>
-    arrange(date)
-}
-
-# ACWR for a whole cohort, matching compute_acwr()'s output columns.
-compute_cohort_acwr <- function(gps, cohort, load_col = "player_load") {
-  series <- cohort_daily_load(gps, cohort, load_col)
-  if (is.null(series)) return(NULL)
-  series |>
+generate_dummy_roster <- function() {
+  set.seed(DUMMY_SEED)
+  tribble(
+    ~athlete_name,       ~position_group, ~jersey,
+    "Tom Vaka",          "Front Row",     1,
+    "Sione Latu",        "Front Row",     2,
+    "Marcus Reid",       "Front Row",     3,
+    "Jack O'Neill",      "Locks",    4,
+    "Dan Whitfield",     "Locks",    5,
+    "Liam Carter",       "Loose Forwards",      6,
+    "Sam Tuilagi",       "Loose Forwards",      7,
+    "Ben Aualiitia",     "Loose Forwards",      8,
+    "Nate Brooks",       "Half-Backs",    9,
+    "Kyle Mercer",       "Half-Backs",    10,
+    "Jared Fine",        "Back Three",    11,
+    "Owen Sisk",         "Midfield",      12,
+    "Chris Nkosi",       "Midfield",      13,
+    "Alex Duval",        "Back Three",    14,
+    "Ryan Kepu",         "Back Three",    15,
+    "Hugo Anders",       "Front Row",     16,
+    "Pete Malone",       "Locks",    17,
+    "Tomas Vega",        "Loose Forwards",      18,
+    "Eli Waters",        "Half-Backs",    19,
+    "Cole Bryant",       "Midfield",      20
+  ) |>
     mutate(
-      athlete_name   = cohort,
-      position_group = cohort,
-      acute   = ewma_vec(daily_load, 7),
-      chronic = ewma_vec(daily_load, 28),
-      acwr    = if_else(chronic > 0, acute / chronic, NA_real_)
+      athlete_id = sprintf("ath_%02d", row_number()),
+      # Individual all-time Vmax (m/s): backs faster than tight forwards.
+      vmax = case_when(
+        position_group %in% c("Front Row", "Locks") ~ runif(n(), 7.6, 8.4),
+        position_group == "Loose Forwards"                     ~ runif(n(), 8.2, 8.9),
+        position_group %in% c("Half-Backs", "Midfield")  ~ runif(n(), 8.7, 9.4),
+        TRUE                                             ~ runif(n(), 9.0, 9.8)
+      ) |> round(2)
     )
 }
 
-# Weekly breakdown for a cohort, same columns as compute_athlete_weekly().
-compute_cohort_weekly <- function(gps, cohort) {
-  d <- gps |> filter(position_group == cohort)
-  if (nrow(d) == 0) return(compute_athlete_weekly(gps, "__none__"))
-  n_ath <- n_distinct(d$athlete_id)
+# 10 weeks of daily athlete-sessions: Tue/Thu train, Sat match, else off/gym.
+generate_dummy_gps <- function(roster, weeks = 10) {
+  set.seed(DUMMY_SEED + 1)
+  end   <- Sys.Date()
+  dates <- seq(end - weeks * 7 + 1, end, by = "day")
 
-  pct_chg <- function(x, adjacent) {
-    prev <- lag(x)
-    if_else(adjacent & !is.na(prev) & prev > 0,
-            100 * (x - prev) / prev, NA_real_)
-  }
-
-  d |>
-    mutate(week = floor_date(date, "week", week_start = 1)) |>
-    group_by(week) |>
-    summarise(
-      sessions = n_distinct(date),
-      td   = sum(distance, na.rm = TRUE) / n_ath,
-      hsr  = sum(hsr_distance, na.rm = TRUE) / n_ath,
-      ad   = (sum(accels, na.rm = TRUE) + sum(decels, na.rm = TRUE)) / n_ath,
-      hmld = sum(hmld, na.rm = TRUE) / n_ath,
-      .groups = "drop"
-    ) |>
-    arrange(week) |>
-    mutate(adjacent = !is.na(lag(week)) &
-             as.numeric(week - lag(week)) == 7) |>
-    mutate(across(c(td, hsr, ad, hmld),
-                  ~ pct_chg(.x, adjacent), .names = "d_{.col}")) |>
-    select(-adjacent)
-}
-
-# ------------------------------------------------------------------------------
-# 3c. LONGITUDINAL MATCH EXPOSURE (last N matches)
-# ------------------------------------------------------------------------------
-# Chronic match exposure separates two very different athletes who look alike
-# in a single-game view: 3 x 80 min carries accumulated fatigue + collision
-# load (freshness problem); 3 x 30 min carries a match-conditioning deficit
-# (fitness problem). Exposure tiers drive opposite interventions.
-compute_match_aggregate <- function(gps, n_matches = 3) {
-  match_dates <- gps |>
-    filter(session_type == "match") |>
-    distinct(date) |>
-    slice_max(date, n = n_matches) |>
-    pull(date)
-
-  gps |>
-    filter(session_type == "match", date %in% match_dates) |>
-    group_by(athlete_id, athlete_name, position_group) |>
-    summarise(
-      matches_played = n(),
-      total_minutes  = sum(match_minutes, na.rm = TRUE),
-      mean_minutes   = mean(match_minutes, na.rm = TRUE),
-      total_distance = sum(distance, na.rm = TRUE),
-      total_hsr      = sum(hsr_distance, na.rm = TRUE),
-      total_hmld     = sum(hmld, na.rm = TRUE),
-      total_contacts = sum(contacts, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
+  grid <- expand_grid(date = dates, athlete_id = roster$athlete_id) |>
+    left_join(roster, by = "athlete_id") |>
     mutate(
-      available_min = length(match_dates) * THRESHOLDS$match_full_min,
-      exposure_pct  = 100 * total_minutes / available_min,
-      exposure_tier = case_when(
-        exposure_pct >= 75 ~ "High exposure",
-        exposure_pct >= 40 ~ "Moderate exposure",
-        TRUE               ~ "Low exposure"
-      ),
-      implication = case_when(
-        exposure_pct >= 75 ~
-          "Manage freshness: trim mid-week volume, prioritise recovery",
-        exposure_pct >= 40 ~
-          "Balanced: standard weekly rhythm",
-        TRUE ~
-          "Match-fitness deficit: add game-intensity conditioning (HMLD/HSR top-ups)"
+      dow = wday(date, week_start = 1),
+      session_type = case_when(
+        dow %in% c(2, 4) ~ "training",  # Tue / Thu field sessions
+        dow == 6         ~ "match",     # Sat match day
+        TRUE             ~ NA_character_
       )
     ) |>
-    arrange(desc(exposure_pct))
-}
+    filter(!is.na(session_type))
 
-# ------------------------------------------------------------------------------
-# 3d. DAILY TRAINING-LOAD GUIDANCE (Availability tab)
-# ------------------------------------------------------------------------------
-# Merges the coach-set availability status with objective monitoring data
-# (wellness z, soreness, ACWR, speed-vaccine state) into one actionable line
-# per athlete. Priority order: medical status > wellness red flags > load
-# state > speed exposure. Deliberately terse -- this is sideline language,
-# not a report.
-AVAILABILITY_STATUSES <- c("Full Participation", "Non-Contact",
-                           "Limited Running", "Off-Feet", "Out",
-                           "Sick", "Injured")
-
-suggest_training_load <- function(status, readiness, readiness_z, soreness,
-                                  aches, vaccine_status, acwr) {
-  g <- function(x) if (length(x) == 0 || all(is.na(x))) NA else x[1]
-  readiness <- g(readiness); readiness_z <- g(readiness_z)
-  soreness <- g(soreness); aches <- g(aches)
-  vaccine_status <- g(as.character(vaccine_status)); acwr <- g(acwr)
-
-  if (status %in% c("Out", "Injured"))
-    return("No team training — rehab / return-to-play pathway with medical")
-  if (status == "Sick")
-    return("No training — return once symptom-free 24 h, then graded re-entry")
-
-  parts <- character(0)
-  if (status == "Non-Contact")
-    parts <- c(parts, "skills + running only, NO contact")
-  if (status == "Limited Running")
-    parts <- c(parts, "cap running volume, no HSR/sprint work")
-  if (status == "Off-Feet")
-    parts <- c(parts, "bike/pool conditioning only")
-
-  if (!is.na(readiness_z) && readiness_z < THRESHOLDS$wellness_z_flag)
-    parts <- c(parts, "reduce volume 25-30% (wellness z-flag)")
-  else if (!is.na(readiness) && readiness < 60)
-    parts <- c(parts, "reduce volume ~20% (low readiness)")
-
-  if (!is.na(soreness) && soreness >= THRESHOLDS$soreness_severe)
-    parts <- c(parts, "limit eccentric + collision load (severe soreness)")
-  if (!is.na(aches) && !(trimws(aches) %in% c("N/A", "n/a", "None", "")))
-    parts <- c(parts, paste0("monitor: ", aches))
-
-  if (!is.na(acwr)) {
-    if (acwr > THRESHOLDS$acwr_high)
-      parts <- c(parts, sprintf("ACWR %.2f high — trim today's load", acwr))
-    else if (acwr < THRESHOLDS$acwr_low)
-      parts <- c(parts, sprintf("ACWR %.2f low — room to build", acwr))
-  }
-
-  if (!is.na(vaccine_status) && vaccine_status == "Red" &&
-      !(status %in% c("Limited Running", "Off-Feet")))
-    parts <- c(parts, "add ≥90% Vmax exposure in warm-up")
-
-  if (length(parts) == 0) return("Full planned load")
-  paste(parts, collapse = " · ")
-}
-
-# ------------------------------------------------------------------------------
-# 4. MATCH-MINUTE TOP-UP ENGINE
-# ------------------------------------------------------------------------------
-# Non-starters and early substitutions accumulate a "match-day deficit". The
-# top-up closes that gap within ~24 h so the weekly rhythm (and chronic load)
-# survives selection decisions. High-minute + high-collision players get the
-# opposite: a Tuesday volume reduction to protect recovery.
-prescribe_topup <- function(match_df) {
-  # Collision/accel flags are RELATIVE (top quartile of this match) rather
-  # than absolute counts -- impact/effort scales differ across GPS vendors
-  # and threshold configs, but "who took the most punishment" doesn't.
-  q75 <- function(x) {
-    x <- x[!is.na(x)]
-    if (length(x) == 0) return(Inf)   # metric absent -> nobody flagged
-    quantile(x, 0.75)
-  }
-  contact_ref <- q75(match_df$contacts)
-  accel_ref   <- q75(match_df$accels)
-
-  match_df |>
+  grid |>
     mutate(
-      tier = case_when(
-        match_minutes < 30                    ~ "High Top-Up",
-        match_minutes < 60                    ~ "Moderate Top-Up",
-        TRUE                                  ~ "Standard Recovery"
+      # Positional locomotor scalar: backs cover more HSR, tight five less.
+      pos_scalar = case_when(
+        position_group == "Front Row"  ~ 0.80,
+        position_group == "Locks" ~ 0.88,
+        position_group == "Loose Forwards"   ~ 1.00,
+        position_group == "Half-Backs" ~ 1.10,
+        position_group == "Midfield"   ~ 1.08,
+        TRUE                           ~ 1.05
       ),
-      reduce_tuesday = match_minutes > 70 &
-        (coalesce(contacts, -Inf) >= contact_ref | accels >= accel_ref),
-      prescription = case_when(
-        tier == "High Top-Up" ~
-          "4 x 100 m tempo (70-80% Vmax) + 6 high accels (>2.5 m/s2) + 2 x 40 m HSR builds",
-        tier == "Moderate Top-Up" ~
-          "2 x 100 m tempo + 4 high accels + 1 x 40 m HSR build",
-        reduce_tuesday ~
-          "Standard recovery; FLAG: -15% Tuesday volume (high minutes + collision load)",
-        TRUE ~ "Standard recovery protocol (pool/bike flush, mobility)"
-      )
-    )
+      is_match     = session_type == "match",
+      match_minutes = if_else(is_match,
+                              pmin(80, round(rnorm(n(), 61, 22))), NA_real_),
+      match_minutes = if_else(is_match, pmax(8, match_minutes), NA_real_),
+      minute_scalar = if_else(is_match, match_minutes / 80, 1),
+      duration_min = if_else(is_match, match_minutes,
+                             round(rnorm(n(), 75, 10))),
+      distance = round((if_else(is_match, 6000, 4200) *
+                          pos_scalar * minute_scalar) * rnorm(n(), 1, 0.10)),
+      hsr_distance = round((if_else(is_match, 420, 260) *
+                              pos_scalar^2 * minute_scalar) * rnorm(n(), 1, 0.25)),
+      accels = round((if_else(is_match, 48, 30) * minute_scalar) *
+                       rnorm(n(), 1, 0.20)),
+      decels = round((if_else(is_match, 44, 26) * minute_scalar) *
+                       rnorm(n(), 1, 0.20)),
+      # HMLD scalar differs from locomotor scalar: tight forwards do MORE
+      # relative high-metabolic work (repeat accels, scrums, cleanouts) than
+      # their HSR profile suggests.
+      hmld_scalar = case_when(
+        position_group == "Front Row"  ~ 0.92,
+        position_group == "Locks" ~ 0.96,
+        position_group == "Loose Forwards"   ~ 1.12,
+        position_group == "Half-Backs" ~ 1.05,
+        position_group == "Midfield"   ~ 1.05,
+        TRUE                           ~ 1.00
+      ),
+      hmld = round((if_else(is_match, 560, 320) * hmld_scalar * minute_scalar) *
+                     rnorm(n(), 1, 0.18)),
+      contacts = if_else(is_match,
+                         round(pmax(0, rnorm(n(), 22, 8)) * minute_scalar *
+                                 if_else(position_group %in%
+                                           c("Front Row","Locks","Loose Forwards"),
+                                         1.4, 0.8)), NA_real_),
+      # Session max velocity: usually 78-95% of Vmax; occasional true exposure.
+      max_vel = round(vmax * pmin(1, rbeta(n(), 8, 1.8)), 2),
+      player_load = round(distance * 0.105 * rnorm(n(), 1, 0.06))
+    ) |>
+    mutate(across(c(distance, hsr_distance, accels, decels, hmld, player_load),
+                  ~ pmax(0, .x))) |>
+    mutate(opponent = if_else(session_type == "match",
+                              "Scrimmage (demo)", NA_character_),
+           activity_tag = if_else(session_type == "match", "MD", "Training")) |>
+    select(date, athlete_id, athlete_name, position_group, vmax, session_type,
+           activity_tag, opponent, duration_min, match_minutes, contacts,
+           distance, hsr_distance, hmld, accels, decels, max_vel, player_load)
+}
+
+# Daily wellness mirroring the LIVE Form schema (1-10 scales, mixed
+# direction, injury-report fields) so demo and live modes are drop-in
+# interchangeable. Two athletes deliberately decline late so alert logic
+# is visible out of the box.
+generate_dummy_wellness <- function(roster, weeks = 10) {
+  set.seed(DUMMY_SEED + 2)
+  end   <- Sys.Date()
+  dates <- seq(end - weeks * 7 + 1, end, by = "day")
+
+  baselines <- roster |>
+    transmute(athlete_id, athlete_name,
+              base = runif(n(), 6.5, 8.5))   # athlete's normal (1-10 space)
+
+  clamp10 <- function(x) pmin(10, pmax(1, round(x)))
+
+  expand_grid(date = dates, athlete_id = roster$athlete_id) |>
+    left_join(baselines, by = "athlete_id") |>
+    mutate(
+      # Post-match dip: Sunday wellbeing drops (match on Saturday).
+      match_dip = if_else(wday(date, week_start = 1) == 7, -1.6, 0),
+      # Two athletes trending down over the final 10 days -> demo red flags.
+      decline = if_else(athlete_id %in% c("ath_06", "ath_13") &
+                          date > max(date) - 10,
+                        -as.numeric(date - (max(date) - 10)) * 0.25, 0),
+      wellbeing = base + match_dip + decline,
+      sleep_quantity = round(pmin(10, pmax(4, rnorm(n(), 7.8, 0.9))), 1),
+      sleep_quality  = clamp10(wellbeing * 0.9 + rnorm(n(), 0, 1)),
+      energy         = clamp10(wellbeing + rnorm(n(), 0, 1.1)),
+      # Higher = WORSE for soreness/stress (matches the live Form).
+      soreness       = clamp10(11 - wellbeing + rnorm(n(), 0, 1.2)),
+      stress         = clamp10(11 - wellbeing * 0.8 + rnorm(n(), 0, 1) - 2),
+      aches = case_when(
+        athlete_id == "ath_06" & date > max(date) - 10 ~ "Hamstring",
+        athlete_id == "ath_13" & date > max(date) - 10 ~ "Lower Back",
+        soreness >= 8 & runif(n()) < 0.5               ~ "General soreness",
+        TRUE                                           ~ "N/A"
+      ),
+      severity  = if_else(aches == "N/A", 0,
+                          pmin(3, pmax(1, round(soreness / 3)))),
+      treatment = if_else(aches == "N/A", "Nothing",
+                          "Following assigned Rehab"),
+      atc_notes = ""
+    ) |>
+    select(date, athlete_id, athlete_name, sleep_quantity, sleep_quality,
+           energy, soreness, stress, aches, treatment, atc_notes, severity)
+}
+
+# ------------------------------------------------------------------------------
+# 4. UNIFIED LOADERS (live if credentialed, else dummy)
+# ------------------------------------------------------------------------------
+# Source precedence for GPS: Catapult API (if token set) -> GPS Google Sheet
+# -> dummy demo squad. Wellness: Google Sheet -> dummy. Capability flags tell
+# modules which metrics this source actually provides, so missing metrics are
+# hidden rather than rendered as misleading zeros.
+load_all_data <- function(weeks = 10) {
+  demo_roster <- generate_dummy_roster()
+  gps_live <- FALSE
+
+  gps <- if (has_catapult()) {
+    tryCatch({
+      g <- fetch_catapult_sessions(Sys.Date() - weeks * 7, Sys.Date()) |>
+        left_join(demo_roster |> select(athlete_id, position_group, vmax),
+                  by = "athlete_id")
+      gps_live <- TRUE
+      g
+    }, error = function(e) {
+      warning("Catapult fetch failed, using dummy data: ", conditionMessage(e))
+      generate_dummy_gps(demo_roster, weeks)
+    })
+  } else if (has_gps_sheet()) {
+    tryCatch({
+      g <- fetch_gps_sheet()
+      gps_live <- TRUE
+      g
+    }, error = function(e) {
+      warning("GPS sheet fetch failed, using dummy data: ", conditionMessage(e))
+      generate_dummy_gps(demo_roster, weeks)
+    })
+  } else generate_dummy_gps(demo_roster, weeks)
+
+  # Post-processing must never be able to kill the session: an error here
+  # escapes into a module observer, which Shiny cannot catch, and the whole
+  # app disconnects. Degrade instead -- unmapped positions or a missing
+  # vmax are survivable; a dead app is not.
+  gps <- tryCatch(apply_roster_override(gps), error = function(e) {
+    warning("Roster override failed, using sheet values: ",
+            conditionMessage(e)); gps })
+  gps <- tryCatch(derive_vmax(gps), error = function(e) {
+    warning("Top-speed derivation failed: ", conditionMessage(e))
+    if (!"vmax" %in% names(gps)) gps$vmax <- NA_real_
+    gps })
+  if (!"vmax" %in% names(gps)) gps$vmax <- NA_real_
+
+  # Roster derives from whatever GPS source won.
+  roster <- gps |> distinct(athlete_id, athlete_name, position_group, vmax)
+
+  wellness_live <- FALSE
+  wellness <- if (has_wellness_sheet()) {
+    tryCatch({
+      w <- fetch_wellness() |>
+        left_join(roster |> select(athlete_id, athlete_name),
+                  by = "athlete_name") |>
+        # Names not (yet) in the roster mapping still need a stable grouping
+        # key for within-athlete z-scores.
+        mutate(athlete_id = coalesce(
+          athlete_id, paste0("ws_", as.integer(factor(athlete_name)))))
+      wellness_live <- TRUE
+      w
+    }, error = function(e) {
+      warning("Sheets fetch failed, using dummy data: ", conditionMessage(e))
+      generate_dummy_wellness(demo_roster, weeks)
+    })
+  } else generate_dummy_wellness(demo_roster, weeks)
+
+  testing <- tryCatch(fetch_testing(), error = function(e) {
+    warning("Testing sheet fetch failed: ", conditionMessage(e))
+    tibble(athlete_name = character(), test_date = as_date(character()),
+           metric = character(), value = numeric())
+  })
+
+  testing_metrics <- attr(testing, "available_metrics")
+  if (is.null(testing_metrics)) testing_metrics <- unique(testing$metric)
+
+  list(
+    roster    = roster,
+    gps       = gps,
+    wellness  = wellness,
+    testing   = testing,
+    testing_metrics = testing_metrics,
+    has_hmld  = any(!is.na(gps$hmld)),
+    has_load  = any(!is.na(gps$player_load)),
+    live      = c(gps = gps_live, wellness = wellness_live,
+                  testing = nrow(testing) > 0)
+  )
 }
