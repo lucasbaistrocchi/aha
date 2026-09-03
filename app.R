@@ -170,7 +170,7 @@ server <- function(input, output, session) {
     mod_availability_server("availability", app_data,
                             wellness_scored, vaccine_status)
     mod_longitudinal_server("longitudinal", app_data)
-    mod_speed_vaccine_server("vaccine", vaccine_status)
+    mod_speed_vaccine_server("vaccine", vaccine_status, app_data)
     mod_positional_server("positional", app_data)
     mod_match_minutes_server("minutes", app_data)
     mod_match_day_server("matchday", app_data)
