@@ -31,6 +31,29 @@ mod_home_ui <- function(id) {
         reactableOutput(ns("group_briefing")),
         uiOutput(ns("briefing_notes"))
       )
+    ),
+    card(
+      card_header(
+        div(class = paste("d-flex justify-content-between",
+                          "align-items-center gap-2 flex-wrap"),
+            span("Athlete detail by positional group"),
+            div(class = "d-flex gap-2 flex-wrap",
+                div(style = "width:190px;margin-bottom:0",
+                    selectInput(ns("bar_cohort"), NULL, choices = NULL,
+                                width = "180px")),
+                div(style = "width:190px;margin-bottom:0",
+                    selectInput(ns("bar_metric"), NULL,
+                                choices = c("Distance (m)" = "distance",
+                                            "HSR (m)" = "hsr_distance",
+                                            "A+D efforts" = "ad",
+                                            "HMLD (m)" = "hmld"),
+                                width = "180px"))))
+      ),
+      p(class = "text-muted small mb-1",
+        "This week's accumulated load per athlete. Dashed line = the cohort's
+         forecast for the selected pre-season week; bars are gold where an
+         athlete is under 70% of it."),
+      uiOutput(ns("cohort_bar_ui"))
     )
   )
 }
@@ -129,6 +152,92 @@ mod_home_server <- function(id, data, wellness_scored, vaccine, pre_week) {
         ),
         theme = ams_react_theme
       )
+    })
+
+    # --- Athlete bars within a cohort ----------------------------------------
+    observeEvent(data(), {
+      groups <- intersect(POSITION_GROUPS,
+                          unique(data()$gps$position_group))
+      extra <- setdiff(unique(data()$gps$position_group), POSITION_GROUPS)
+      updateSelectInput(session, "bar_cohort",
+                        choices = c(groups, sort(extra)))
+    })
+
+    bar_data <- reactive({
+      req(input$bar_cohort, input$bar_metric)
+      win <- preseason_week_window(pre_week())
+      d <- data()$gps |>
+        filter(position_group == input$bar_cohort,
+               date >= win[1], date <= win[2])
+      validate(need(nrow(d) > 0,
+                    "No sessions for this group in the selected week."))
+
+      d |>
+        mutate(ad = accels + coalesce(decels, 0)) |>
+        group_by(athlete_name) |>
+        summarise(value = sum(.data[[input$bar_metric]], na.rm = TRUE),
+                  .groups = "drop") |>
+        arrange(value)
+    })
+
+    # Per-athlete forecast for the selected metric = cohort benchmark x the
+    # week multiplier, i.e. exactly the target the Weekly Load tab uses.
+    bar_target <- reactive({
+      bm <- MATCH_BENCHMARKS |>
+        filter(position_group == input$bar_cohort)
+      if (nrow(bm) != 1) return(NA_real_)
+      mult <- WEEK_MULTIPLIERS[max(1, min(pre_week(),
+                                          length(WEEK_MULTIPLIERS)))]
+      switch(input$bar_metric,
+             distance     = bm$bm_distance,
+             hsr_distance = bm$bm_hsr,
+             ad           = bm$bm_ad,
+             hmld         = bm$bm_hmld,
+             NA_real_) * mult
+    })
+
+    output$cohort_bar_ui <- renderUI({
+      n <- tryCatch(nrow(bar_data()), error = function(e) 0)
+      div(style = "max-height:560px;overflow-y:auto",
+          plotlyOutput(session$ns("cohort_bar"),
+                       height = bar_chart_height(n, px_per_row = 21,
+                                                 min_px = 240)))
+    })
+
+    output$cohort_bar <- renderPlotly({
+      d <- bar_data()
+      tgt <- bar_target()
+      lbl <- c(distance = "Distance (m)", hsr_distance = "HSR (m)",
+               ad = "A+D efforts", hmld = "HMLD (m)")[[input$bar_metric]]
+
+      d <- d |>
+        mutate(col = if (is.na(tgt)) AMS_COLORS$primary
+                     else if_else(value < 0.7 * tgt, AMS_COLORS$gold,
+                                  AMS_COLORS$primary))
+
+      p <- plot_ly(d, x = ~value,
+                   y = ~factor(athlete_name, levels = athlete_name),
+                   type = "bar", orientation = "h",
+                   marker = list(color = ~col),
+                   hovertemplate = paste0("%{y}: %{x:,.0f}",
+                                          "<extra></extra>")) |>
+        layout(xaxis = list(title = lbl, automargin = TRUE),
+               yaxis = list(title = "", tickfont = list(size = 10),
+                            automargin = TRUE),
+               bargap = 0.25, showlegend = FALSE)
+
+      if (is.finite(tgt))
+        p <- p |> layout(shapes = list(list(
+          type = "line", x0 = tgt, x1 = tgt,
+          y0 = -0.5, y1 = nrow(d) - 0.5,
+          line = list(dash = "dash", color = AMS_COLORS$red, width = 2))))
+
+      p |> ams_plotly_layout(
+        sprintf("%s — %s this week%s", input$bar_cohort, lbl,
+                if (is.finite(tgt))
+                  sprintf(" (forecast %s)",
+                          format(round(tgt), big.mark = ",")) else ""),
+        margin_l = 150)
     })
 
     output$briefing_notes <- renderUI({
