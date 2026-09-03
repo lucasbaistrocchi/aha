@@ -152,9 +152,39 @@ server <- function(input, output, session) {
     modules_started(TRUE)
 
     # Single load at startup; refreshes every 15 min for live deployments.
+    # Wrapped so a bad sheet read surfaces as a notification rather than
+    # taking the R process down -- module observers call this, and an error
+    # inside an observer disconnects every user.
+    load_failed <- reactiveVal(NULL)
     app_data <- reactive({
       invalidateLater(15 * 60 * 1000, session)
-      load_all_data(weeks = 10)
+      tryCatch({
+        d <- load_all_data(weeks = 10)
+        load_failed(NULL)
+        d
+      }, error = function(e) {
+        load_failed(conditionMessage(e))
+        # Demo data keeps the app usable and obviously-not-live (the navbar
+        # badges read DEMO) instead of a blank disconnected screen.
+        roster <- generate_dummy_roster()
+        list(roster = roster,
+             gps = derive_vmax(generate_dummy_gps(roster, 10)),
+             wellness = generate_dummy_wellness(roster, 10),
+             testing = tibble(athlete_name = character(),
+                              test_date = as_date(character()),
+                              metric = character(), value = numeric()),
+             testing_metrics = character(),
+             has_hmld = TRUE, has_load = TRUE,
+             live = c(gps = FALSE, wellness = FALSE, testing = FALSE))
+      })
+    })
+
+    observeEvent(load_failed(), {
+      req(load_failed())
+      showNotification(
+        paste("Could not load live data — showing demo data instead.",
+              "Detail:", load_failed()),
+        type = "error", duration = NULL)
     })
 
     # Shared derived reactives -- computed once, consumed by several modules.
