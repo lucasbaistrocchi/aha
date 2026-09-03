@@ -16,7 +16,12 @@ mod_testing_ui <- function(id) {
     layout_columns(
       col_widths = c(3, 9),
       card(
-        card_header("Select test"),
+        card_header(
+          div(class = paste("d-flex justify-content-between",
+                            "align-items-center gap-2 flex-wrap"),
+              span("Select test"),
+              downloadButton(ns("export_pdf"), "PDF", class = "btn-sm"))
+        ),
         selectInput(ns("metric"), "Test", choices = NULL),
         selectInput(ns("test_date"), "Testing date", choices = NULL),
         selectInput(ns("cohort"), "Cohort filter",
@@ -239,6 +244,61 @@ mod_testing_server <- function(id, data) {
         ams_plotly_layout(paste(m$metric, "by position group"),
                           margin_b = 86)
     })
+
+    # --- PDF export: ranked results for the selected test -------------------
+    output$export_pdf <- downloadHandler(
+      filename = function()
+        paste0("testing-",
+               gsub("[^A-Za-z0-9]+", "-", input$metric %||% "test"),
+               "-", Sys.Date(), ".pdf"),
+      content = function(file) {
+        m <- meta()
+        d <- filtered() |>
+          arrange(if (m$higher_better) desc(value) else value)
+        s <- scored()
+
+        date_lbl <- if (identical(input$test_date, "__best__"))
+          "All-time best" else {
+            dd <- suppressWarnings(as_date(input$test_date))
+            if (is.na(dd)) "Undated" else test_date_label(dd)
+          }
+
+        cols <- list(
+          list(label = "#",           x = 0.00, align = "left"),
+          list(label = "ATHLETE",     x = 0.05, align = "left"),
+          list(label = "COHORT",      x = 0.38, align = "left"),
+          list(label = "VALUE",       x = 0.68, align = "right"),
+          list(label = "VS COHORT",   x = 0.82, align = "right"),
+          list(label = "SQUAD %ILE",  x = 0.99, align = "right"))
+
+        rows <- lapply(seq_len(nrow(d)), function(i) c(
+          as.character(i),
+          d$athlete_name[i],
+          as.character(d$position_group[i]),
+          formatC(d$value[i], format = "f", digits = 2, big.mark = ","),
+          sprintf("%+.2f", d$value[i] - d$cohort_mean[i]),
+          sprintf("%.0f", d$squad_pct[i])))
+
+        # Percentile column keeps the on-screen colour bands.
+        colour_fn <- function(i, j) {
+          if (j != 6) return("#222222")
+          p <- d$squad_pct[i]
+          if (p >= 75) "#1E8449" else if (p >= 40) "#B7950B" else "#C0392B"
+        }
+
+        grDevices::pdf(file, width = 8.5, height = 11)
+        on.exit(grDevices::dev.off(), add = TRUE)
+        pdf_table(
+          title = paste0("Performance Testing — ", m$metric),
+          subtitle = sprintf(
+            "%s | %s | %s is better | squad n=%d, mean %.2f, SD %.2f",
+            date_lbl,
+            if (identical(input$cohort, "All cohorts")) "All cohorts"
+              else input$cohort,
+            if (m$higher_better) "higher" else "lower",
+            nrow(s), mean(s$value), sd(s$value)),
+          cols = cols, rows = rows, colour_fn = colour_fn)
+      })
 
     output$detail_table <- renderReactable({
       m <- meta()
