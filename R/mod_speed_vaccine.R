@@ -19,6 +19,14 @@ mod_speed_vaccine_ui <- function(id) {
       value_box(title = "Red (>7 days)", value = textOutput(ns("n_red")),
                 showcase = icon("circle-exclamation"), theme = "danger")
     ),
+    card(
+      card_header("Days since last ≥90% Vmax exposure"),
+      p(class = "text-muted small mb-1",
+        "Bars use the same traffic light as the table: green ≤5 days,
+         gold 6-7, red >7 or never. Athletes with no exposure in the window
+         are plotted at the top of the red band."),
+      uiOutput(ns("vaccine_plot_ui"))
+    ),
     layout_columns(
       col_widths = c(7, 5),
       card(
@@ -44,6 +52,68 @@ mod_speed_vaccine_server <- function(id, vaccine) {
     output$n_green  <- renderText(as.character(sum(vaccine()$status == "Green")))
     output$n_yellow <- renderText(as.character(sum(vaccine()$status == "Yellow")))
     output$n_red    <- renderText(as.character(sum(vaccine()$status == "Red")))
+
+    # --- Colour-coded bars, same categorisation as the table ----------------
+    output$vaccine_plot_ui <- renderUI({
+      n <- tryCatch(nrow(vaccine()), error = function(e) 0)
+      div(style = "max-height:620px;overflow-y:auto",
+          plotlyOutput(session$ns("vaccine_plot"),
+                       height = bar_chart_height(n, px_per_row = 20)))
+    })
+
+    output$vaccine_plot <- renderPlotly({
+      v <- vaccine()
+      validate(need(nrow(v) > 0, "No GPS data loaded."))
+
+      # "Never exposed" has no numeric days-since; plot it just past the
+      # worst real value so it reads as the most overdue, not as a gap.
+      max_days <- suppressWarnings(max(v$days_since, na.rm = TRUE))
+      if (!is.finite(max_days)) max_days <- THRESHOLDS$vaccine_yellow + 1
+      never_at <- max_days + 2
+
+      d <- v |>
+        mutate(
+          plot_days = if_else(is.na(days_since), never_at,
+                              as.numeric(days_since)),
+          bar_col = case_when(
+            status == "Green"  ~ AMS_COLORS$green,
+            status == "Yellow" ~ AMS_COLORS$gold,
+            TRUE               ~ AMS_COLORS$red),
+          lbl = if_else(is.na(days_since), "never",
+                        paste0(days_since, "d"))
+        ) |>
+        arrange(plot_days)   # most recently exposed at the bottom
+
+      plot_ly(d, x = ~plot_days,
+              y = ~factor(athlete_name, levels = athlete_name),
+              type = "bar", orientation = "h",
+              marker = list(color = ~bar_col),
+              text = ~lbl, textposition = "outside", cliponaxis = FALSE,
+              hovertemplate = paste0("%{y}<br>%{text} since last dose",
+                                     "<extra></extra>")) |>
+        layout(
+          xaxis = list(title = "Days since exposure",
+                       range = c(0, never_at * 1.18), automargin = TRUE),
+          yaxis = list(title = "", tickfont = list(size = 10),
+                       automargin = TRUE),
+          bargap = 0.25,
+          showlegend = FALSE,
+          # Boundaries of the traffic light, drawn where the categories change.
+          shapes = list(
+            list(type = "line", x0 = THRESHOLDS$vaccine_green + 0.5,
+                 x1 = THRESHOLDS$vaccine_green + 0.5,
+                 y0 = -0.5, y1 = nrow(d) - 0.5,
+                 line = list(dash = "dot", color = AMS_COLORS$gold,
+                             width = 1.5)),
+            list(type = "line", x0 = THRESHOLDS$vaccine_yellow + 0.5,
+                 x1 = THRESHOLDS$vaccine_yellow + 0.5,
+                 y0 = -0.5, y1 = nrow(d) - 0.5,
+                 line = list(dash = "dot", color = AMS_COLORS$red,
+                             width = 1.5)))
+        ) |>
+        ams_plotly_layout("Speed vaccine — dotted lines mark 5 and 7 days",
+                          margin_l = 150)
+    })
 
     output$vaccine_table <- renderReactable({
       tbl <- vaccine() |>
