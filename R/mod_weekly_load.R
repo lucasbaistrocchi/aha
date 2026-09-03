@@ -41,6 +41,13 @@ mod_weekly_load_ui <- function(id) {
         ),
         card(
           card_header("Group breakdown — accumulated vs forecast"),
+          p(class = "text-muted small mb-1",
+            sprintf(paste("Cohort figures count only athletes who attended",
+                          ">%.0f%% of the week's sessions — partial",
+                          "attendance is an availability story, not a",
+                          "prescription one. Everyone still appears in the",
+                          "athlete table below."),
+                    ATTENDANCE_MIN * 100)),
           reactableOutput(ns("group_table"))
         )
       )
@@ -154,6 +161,7 @@ mod_weekly_load_server <- function(id, data) {
         transmute(
           Cohort = as.character(position_group),
           Athletes = n_athletes,
+          Excluded = n_excluded,
           `TD %` = pct_distance,   `TD rem (m)` = round(rem_distance),
           `HSR %` = pct_hsr,       `HSR rem (m)` = round(rem_hsr),
           `A+D %` = pct_ad,        `A+D rem (n)` = round(rem_ad),
@@ -170,8 +178,15 @@ mod_weekly_load_server <- function(id, data) {
           list(color = col, fontWeight = 700)
         }, width = 80)
 
-      cols <- list(`TD %` = pct_col, `HSR %` = pct_col,
-                   `A+D %` = pct_col, `HMLD %` = pct_col)
+      cols <- list(
+        `TD %` = pct_col, `HSR %` = pct_col,
+        `A+D %` = pct_col, `HMLD %` = pct_col,
+        Excluded = colDef(width = 88, cell = function(value) {
+          if (is.na(value) || value == 0) "—" else as.character(value)
+        }, style = function(value) {
+          if (!is.na(value) && value > 0)
+            list(color = AMS_COLORS$gold, fontWeight = 700)
+        }))
       reactable(
         gp, compact = TRUE, striped = TRUE, defaultPageSize = 8,
         defaultColDef = colDef(format = colFormat(separators = TRUE)),
@@ -182,6 +197,7 @@ mod_weekly_load_server <- function(id, data) {
 
     output$athlete_table <- renderReactable({
       win <- preseason_week_window(week_no())
+      att <- compute_attendance(data()$gps, win)
       wd <- data()$gps |>
         filter(date >= win[1], date <= win[2]) |>
         group_by(athlete_id, athlete_name, position_group) |>
@@ -197,11 +213,18 @@ mod_weekly_load_server <- function(id, data) {
           pct_ad   = 100 * ad / (bm_ad * mult()),
           pct_hmld = 100 * hmld / (bm_hmld * mult())
         ) |>
+        left_join(att |> select(athlete_id, sessions_attended,
+                                sessions_possible, attendance,
+                                meets_attendance),
+                  by = "athlete_id") |>
         arrange(pct_td) |>
         transmute(Athlete = athlete_name, Cohort = position_group,
+                  Att = attendance * 100,
+                  Sessions = paste0(sessions_attended, "/", sessions_possible),
                   `TD done (m)` = round(distance),
                   `TD %` = pct_td, `HSR %` = pct_hsr,
-                  `A+D %` = pct_ad, `HMLD %` = pct_hmld)
+                  `A+D %` = pct_ad, `HMLD %` = pct_hmld,
+                  .in_cohort = meets_attendance)
       if (!isTRUE(data()$has_hmld)) wd <- select(wd, -`HMLD %`)
       validate(need(nrow(wd) > 0,
                     "No sessions recorded in this pre-season week yet."))
@@ -215,12 +238,32 @@ mod_weekly_load_server <- function(id, data) {
           list(color = col, fontWeight = 700)
         }, width = 84)
 
-      cols <- list(`TD %` = pct_col, `HSR %` = pct_col,
-                   `A+D %` = pct_col, `HMLD %` = pct_col)
+      cols <- list(
+        `TD %` = pct_col, `HSR %` = pct_col,
+        `A+D %` = pct_col, `HMLD %` = pct_col,
+        Att = colDef(
+          name = "Att %", width = 84,
+          cell = function(value) {
+            if (is.na(value)) "—" else sprintf("%.0f%%", value)
+          },
+          style = function(value) {
+            if (is.na(value)) return(NULL)
+            list(color = if (value > ATTENDANCE_MIN * 100) AMS_COLORS$primary
+                         else AMS_COLORS$gold, fontWeight = 700)
+          }),
+        Sessions = colDef(width = 84),
+        .in_cohort = colDef(show = FALSE))
       reactable(
         wd, compact = TRUE, striped = TRUE, defaultPageSize = 25,
         defaultColDef = colDef(format = colFormat(separators = TRUE)),
         columns = cols[names(cols) %in% names(wd)],
+        # Athletes below the attendance bar are dimmed: still visible and
+        # fully broken down, just not part of the cohort aggregate above.
+        rowStyle = function(index) {
+          if (!isTRUE(wd$.in_cohort[index]))
+            list(opacity = 0.62,
+                 borderLeft = paste("3px solid", AMS_COLORS$gold))
+        },
         theme = ams_react_theme
       )
     })
