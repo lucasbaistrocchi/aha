@@ -440,8 +440,12 @@ pdf_ascii <- function(x) {
 # Draw a simple table on an open pdf() page, paginating as needed.
 # `cols` = named list(label, x, align) ; `rows` = list of character vectors.
 # `colour_fn(row_i, col_j)` optionally returns a colour per cell.
+# `note_fn(i)` optionally returns a longer string for row i (a prescription,
+# an action) drawn wrapped in smaller grey type beneath that row; row height
+# grows to fit, and pagination accounts for it.
 pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
-                      row_h = 0.019) {
+                      row_h = 0.019, note_fn = NULL, note_x = 0.04,
+                      note_width = 105) {
   draw_head <- function() {
     par(mar = c(0.4, 0.6, 0.4, 0.6))
     plot.new(); plot.window(xlim = c(0, 1), ylim = c(0, 1))
@@ -464,7 +468,12 @@ pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
 
   y <- draw_head()
   for (i in seq_along(rows)) {
-    if (y < 0.04) y <- draw_head()
+    note <- if (!is.null(note_fn)) pdf_ascii(note_fn(i) %||% "") else ""
+    wrapped <- if (nzchar(trimws(note)))
+      strwrap(note, width = note_width) else character(0)
+    need <- row_h + length(wrapped) * 0.0145
+    if (y - need < 0.04) y <- draw_head()
+
     vals <- rows[[i]]
     for (j in seq_along(cols)) {
       cl <- cols[[j]]
@@ -473,7 +482,12 @@ pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
            adj = c(if (identical(cl$align, "right")) 1 else 0, 1),
            cex = 0.76, col = col %||% "#222222")
     }
-    y <- y - row_h
+    yy <- y - row_h + 0.004
+    for (w in wrapped) {
+      text(note_x, yy, w, adj = c(0, 1), cex = 0.66, col = "#555555")
+      yy <- yy - 0.0145
+    }
+    y <- y - need
     segments(0, y + 0.006, 1, y + 0.006, col = "#DDDDDD", lwd = 0.4)
   }
   text(0, 0.02, pdf_ascii(paste("Life University Rugby AMS  |  generated",
