@@ -352,6 +352,42 @@ derive_vmax <- function(gps) {
 # Scale direction is MIXED: sleep quality & energy are "higher = better";
 # soreness & stress are "higher = worse". compute_wellness_scores() handles
 # the inversion -- keep raw values raw here (single source of truth).
+# Parse a timestamp cell whatever form it arrives in. Reading sheets as text
+# (col_types = "c") means a datetime can come back as "8/24/2026 13:21:17",
+# as ISO, or as a bare Google serial number -- and one unhandled format turns
+# every date into NA, which silently empties the entire wellness view.
+parse_sheet_datetime <- function(x) {
+  if (inherits(x, "POSIXt")) return(as_datetime(x))
+  if (inherits(x, "Date"))   return(as_datetime(x))
+  if (is.list(x)) x <- vapply(x, function(v)
+    if (length(v) == 0 || is.na(v[1])) NA_character_ else as.character(v[1]),
+    character(1))
+  s <- str_squish(as.character(x))
+  out <- suppressWarnings(mdy_hms(s, quiet = TRUE))
+  try_fmt <- function(out, f) {
+    i <- which(is.na(out))
+    if (length(i)) out[i] <- suppressWarnings(f(s[i], quiet = TRUE))
+    out
+  }
+  out <- try_fmt(out, ymd_hms)
+  out <- try_fmt(out, dmy_hms)
+  out <- try_fmt(out, mdy_hm)
+  out <- try_fmt(out, ymd_hm)
+
+  # Google Sheets serial: days since 1899-12-30, fraction = time of day.
+  i <- which(is.na(out))
+  if (length(i)) {
+    num <- suppressWarnings(as.numeric(s[i]))
+    ok <- !is.na(num) & num > 20000 & num < 80000
+    if (any(ok)) {
+      j <- i[ok]; v <- num[ok]
+      out[j] <- as_datetime(as.Date(floor(v), origin = "1899-12-30")) +
+        (v - floor(v)) * 86400
+    }
+  }
+  out
+}
+
 WELLNESS_SHEET_DEFAULT <- "1i5qT-r4uJuTU3qd6vQK1ZuF97KrBWxATCbER_a4RcMo"
 WELLNESS_TAB <- "WELLNESS"
 
@@ -383,15 +419,18 @@ fetch_wellness <- function() {
       severity       = matches("severe")
     ) |>
     mutate(
-      timestamp = if (inherits(timestamp, "POSIXt")) timestamp
-                  else mdy_hms(as.character(timestamp)),
+      timestamp = parse_sheet_datetime(timestamp),
       date = as_date(timestamp),
       # Sheets can hand back list-columns on mixed input; coerce defensively.
       across(c(sleep_quantity, sleep_quality, energy, soreness, stress,
                severity),
              ~ suppressWarnings(as.numeric(as.character(.x)))),
-      across(c(athlete_name, aches, treatment, atc_notes), as.character)
+      across(c(aches, treatment, atc_notes), as.character),
+      # Same spelling normalisation the GPS and availability sheets get, so
+      # an athlete picked from the GPS roster matches their Form entries.
+      athlete_name = canonical_name(athlete_name)
     ) |>
+    filter(!is.na(date)) |>
     # One row per athlete-day: keep the latest submission (form resubmits).
     group_by(athlete_name, date) |>
     slice_max(timestamp, n = 1, with_ties = FALSE) |>
@@ -429,7 +468,10 @@ TEST_METRICS <- tibble::tribble(
   "Waist (cm)",                 "Anthropometry",  "cm",   FALSE,
   "Hip (cm)",                   "Anthropometry",  "cm",   TRUE,
   "Thigh (cm)",                 "Anthropometry",  "cm",   TRUE,
-  "Jump Height (m)",            "Jump / CMJ",     "m",    TRUE,
+  # Stored in metres in the sheet; converted to cm on read (see
+  # TEST_UNIT_CONVERSIONS) because 0.34 m rounds to "0" in compact chart
+  # labels and coaches read jump height in cm anyway.
+  "Jump Height (m)",            "Jump / CMJ",     "cm",   TRUE,
   "Peak Braking Force (N)",     "Jump / CMJ",     "N",    TRUE,
   "Peak Propulsive Force (N)",  "Jump / CMJ",     "N",    TRUE,
   "Time To Takeoff",            "Jump / CMJ",     "s",    FALSE,
@@ -454,9 +496,23 @@ TEST_METRICS <- tibble::tribble(
 
 # Metrics shown on the Individual Report percentile chart, in display order
 # (top to bottom). A fixed set keeps reports comparable athlete to athlete.
+# Unit conversions applied when the testing sheet is read. Percentiles are
+# rank-based so a linear rescale cannot change any ranking -- it only makes
+# the displayed number sane.
+TEST_UNIT_CONVERSIONS <- c("Jump Height (m)" = 100)   # m -> cm
+
+# Display names: what a coach should see, as opposed to the sheet's column
+# name (which stays the join key).
+TEST_DISPLAY_NAMES <- c("Jump Height (m)" = "CMJ Jump Height (cm)")
+
+test_display_name <- function(metric) {
+  out <- unname(TEST_DISPLAY_NAMES[metric])
+  ifelse(is.na(out), metric, out)
+}
+
 REPORT_METRICS <- tibble::tribble(
   ~metric,                  ~label,
-  "Jump Height (m)",        "CMJ Jump Height",
+  "Jump Height (m)",        "CMJ Jump Height (cm)",
   "SBJ (in)",               "SBJ",
   "Bronco",                 "Bronco",
   "Back Squat 3RM (lbs)",   "Squat 3RM",
@@ -529,7 +585,9 @@ fetch_testing <- function() {
     mutate(across(all_of(present),
                   ~ suppressWarnings(as.numeric(as.character(.x))))) |>
     pivot_longer(all_of(present), names_to = "metric", values_to = "value") |>
-    filter(!is.na(value))
+    filter(!is.na(value)) |>
+    mutate(value = value *
+             coalesce(unname(TEST_UNIT_CONVERSIONS[metric]), 1))
 
   # Columns that EXIST in the sheet, including ones with no results logged
   # yet -- so a newly added test still appears in the Testing dropdown.
