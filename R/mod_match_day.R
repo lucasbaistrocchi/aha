@@ -17,7 +17,12 @@ mod_match_day_ui <- function(id) {
     layout_columns(
       col_widths = c(3, 9),
       card(
-        card_header("Match"),
+        card_header(
+          div(class = paste("d-flex justify-content-between",
+                            "align-items-center gap-2 flex-wrap"),
+              span("Match"),
+              downloadButton(ns("export_pdf"), "PDF", class = "btn-sm"))
+        ),
         selectInput(ns("match_date"), "Match date", choices = NULL),
         selectInput(ns("athlete"), "Athlete", choices = NULL),
         helpText("All comparisons are per-minute (minute-adjusted), so
@@ -128,6 +133,69 @@ mod_match_day_server <- function(id, data) {
         ams_plotly_layout("Match output vs benchmark (100% = full MDB intensity)",
                           margin_b = 150)
     })
+
+    # ---- PDF: whole-squad match report --------------------------------------
+    output$export_pdf <- downloadHandler(
+      filename = function() paste0("matchday-", input$match_date, ".pdf"),
+      content = function(file) {
+        has_h <- isTRUE(data()$has_hmld)
+        d <- match_day() |>
+          left_join(MATCH_BENCHMARKS, by = "position_group") |>
+          mutate(
+            min_frac = match_minutes / THRESHOLDS$match_full_min,
+            pct_dist = 100 * distance / (bm_distance * min_frac),
+            pct_hsr  = 100 * hsr_distance / (bm_hsr * min_frac),
+            pct_hmld = 100 * hmld / (bm_hmld * min_frac),
+            pct_ad   = 100 * ad / (bm_ad * min_frac)
+          ) |>
+          arrange(position_group, desc(match_minutes))
+        validate(need(nrow(d) > 0, "No athletes in this match."))
+
+        opp <- unique(d$opponent[!is.na(d$opponent)])
+        n0 <- function(x) if (is.na(x)) "-" else
+          format(round(x), big.mark = ",")
+        pc <- function(x) if (!is.finite(x)) "-" else sprintf("%.0f%%", x)
+
+        cols <- list(
+          list(label = "ATHLETE",  x = 0.00, align = "left"),
+          list(label = "GROUP",    x = 0.22, align = "left"),
+          list(label = "MIN",      x = 0.45, align = "right"),
+          list(label = "m/min",    x = 0.54, align = "right"),
+          list(label = "DIST %",   x = 0.65, align = "right"),
+          list(label = "HSR %",    x = 0.75, align = "right"),
+          list(label = "HMLD %",   x = 0.86, align = "right"),
+          list(label = "A+D %",    x = 0.97, align = "right"))
+
+        rows <- lapply(seq_len(nrow(d)), function(i) c(
+          d$athlete_name[i], as.character(d$position_group[i]),
+          n0(d$match_minutes[i]),
+          sprintf("%.1f", d$distance[i] / d$match_minutes[i]),
+          pc(d$pct_dist[i]), pc(d$pct_hsr[i]),
+          if (has_h) pc(d$pct_hmld[i]) else "-", pc(d$pct_ad[i])))
+
+        # Percentages are minute-adjusted vs the cohort's 80-min benchmark:
+        # at-or-above reads green, well below reads gold.
+        srcs <- list(`5` = "pct_dist", `6` = "pct_hsr",
+                     `7` = "pct_hmld", `8` = "pct_ad")
+        colour_fn <- function(i, j) {
+          k <- as.character(j)
+          if (is.null(srcs[[k]])) return("#222222")
+          v <- d[[srcs[[k]]]][i]
+          if (!is.finite(v)) return("#999999")
+          if (v >= 100) "#1E8449" else if (v >= 80) "#222222" else "#B7950B"
+        }
+
+        grDevices::pdf(file, width = 8.5, height = 11)
+        on.exit(grDevices::dev.off(), add = TRUE)
+        pdf_table(
+          title = "Match Day Report",
+          subtitle = sprintf(
+            "%s%s  |  %d athletes  |  %% = minute-adjusted vs cohort 80-min benchmark",
+            format(as_date(input$match_date), "%a %b %d, %Y"),
+            if (length(opp)) paste0(" vs ", opp[1]) else "",
+            nrow(d)),
+          cols = cols, rows = rows, colour_fn = colour_fn)
+      })
 
     # ---- Individual: per-minute rates vs group mean and vs MDB --------------
     output$indiv_plot <- renderPlotly({
