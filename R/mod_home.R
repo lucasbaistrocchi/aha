@@ -66,8 +66,14 @@ mod_home_server <- function(id, data, wellness_scored, vaccine, pre_week) {
       ws |> filter(date == max(date))
     })
 
+    # pre_week() is the Weekly Load tab's selection: list(phase, week).
+    sel <- reactive({
+      s <- pre_week()
+      if (is.list(s)) s else list(phase = "pre", week = as.integer(s))
+    })
+
     group_progress <- reactive(
-      compute_group_progress(data()$gps, pre_week()))
+      compute_group_progress(data()$gps, sel()$week, phase = sel()$phase))
 
     output$vb_readiness <- renderText({
       sprintf("%.0f%%", mean(today_wellness()$readiness, na.rm = TRUE))
@@ -171,7 +177,8 @@ mod_home_server <- function(id, data, wellness_scored, vaccine, pre_week) {
 
     bar_data <- reactive({
       req(input$bar_cohort, input$bar_metric)
-      win <- preseason_week_window(pre_week())
+      w <- training_week(sel()$phase, sel()$week)
+      win <- c(w$start, w$end)
       d <- data()$gps |>
         filter(position_group == input$bar_cohort,
                date >= win[1], date <= win[2])
@@ -192,14 +199,14 @@ mod_home_server <- function(id, data, wellness_scored, vaccine, pre_week) {
       bm <- MATCH_BENCHMARKS |>
         filter(position_group == input$bar_cohort)
       if (nrow(bm) != 1) return(NA_real_)
-      mult <- WEEK_MULTIPLIERS[max(1, min(pre_week(),
-                                          length(WEEK_MULTIPLIERS)))]
+      w <- training_week(sel()$phase, sel()$week)
+      # Each metric carries its own multiplier (see training_week()).
       switch(input$bar_metric,
-             distance     = bm$bm_distance,
-             hsr_distance = bm$bm_hsr,
-             ad           = bm$bm_ad,
-             hmld         = bm$bm_hmld,
-             NA_real_) * mult
+             distance     = bm$bm_distance * w$m_td,
+             hsr_distance = bm$bm_hsr      * w$m_hsr,
+             ad           = bm$bm_ad       * w$m_ad,
+             hmld         = bm$bm_hmld     * w$m_hmld,
+             NA_real_)
     })
 
     output$cohort_bar_ui <- renderUI({
