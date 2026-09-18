@@ -14,23 +14,17 @@ mod_weekly_load_ui <- function(id) {
     layout_columns(
       col_widths = c(4, 8),
       card(
-        card_header("Pre-season forecast"),
-        selectInput(ns("pre_week"), "Pre-season week",
-                    choices = setNames(
-                      seq_along(WEEK_MULTIPLIERS),
-                      sprintf("Week %d  (%s, x%.1f)",
-                              seq_along(WEEK_MULTIPLIERS),
-                              format(PRESEASON_START +
-                                       (seq_along(WEEK_MULTIPLIERS) - 1) * 7,
-                                     "%b %d"),
-                              WEEK_MULTIPLIERS))),
+        card_header("Weekly forecast"),
+        selectInput(ns("phase"), "Phase",
+                    choices = c("Pre-season" = "pre", "In-season" = "in")),
+        selectInput(ns("pre_week"), "Week", choices = NULL),
         uiOutput(ns("week_context")),
         p(class = "text-muted small",
-          "Weeks run Monday-Sunday from the pre-season start
-           (10 Aug 2026). Forecasted weekly load per athlete = Target Match
-           Load x the week multiplier, from the master database workbook
-           (data/2026-2027 LIFE U GPS Master Database.xlsx). Update the
-           workbook and restart to change targets."),
+          "Weeks run Monday-Sunday: pre-season from 10 Aug 2026, in-season
+           from 21 Sep 2026. Forecast per athlete = Target Match Load x that
+           week's multiplier, from the master database workbook. In-season
+           multipliers differ by metric (a normal week is x2.65 TD but
+           x2.99 A+D), so each metric carries its own target."),
         card_header("Forecast per athlete (this week)"),
         reactableOutput(ns("forecast_table"))
       ),
@@ -63,32 +57,63 @@ mod_weekly_load_server <- function(id, data) {
   moduleServer(id, function(input, output, session) {
     ns <- session$ns
 
-    # Default to the pre-season week that contains today (Mon-Sun weeks from
-    # PRESEASON_START); clamped to the 6 programmed weeks.
+    # Week choices follow the selected phase, labelled with dates and focus
+    # so the coaching intent ("PEAK - taper") is visible at the point of use.
+    week_choices <- function(phase) {
+      if (identical(phase, "in")) {
+        setNames(seq_len(N_IN_WEEKS()),
+                 sprintf("Week %d — %s (%s)", IN_SEASON_PLAN$week,
+                         IN_SEASON_PLAN$dates, IN_SEASON_PLAN$focus))
+      } else {
+        setNames(seq_len(N_PRE_WEEKS()),
+                 sprintf("Week %d — %s (x%.2f)", seq_len(N_PRE_WEEKS()),
+                         format(PRESEASON_START +
+                                  (seq_len(N_PRE_WEEKS()) - 1) * 7, "%b %d"),
+                         WEEK_MULTIPLIERS))
+      }
+    }
+
+    # Open on the phase and week containing today.
     observeEvent(TRUE, once = TRUE, {
-      wk <- as.integer(floor(as.numeric(
-        floor_date(Sys.Date(), "week", week_start = 1) -
-          PRESEASON_START) / 7)) + 1
-      wk <- max(1, min(wk, length(WEEK_MULTIPLIERS)))
-      updateSelectInput(session, "pre_week", selected = wk)
+      cur <- current_training_week()
+      updateSelectInput(session, "phase", selected = cur$phase)
+      updateSelectInput(session, "pre_week",
+                        choices = week_choices(cur$phase),
+                        selected = cur$week)
     })
 
+    observeEvent(input$phase, {
+      cur <- current_training_week()
+      sel <- if (identical(input$phase, cur$phase)) cur$week else 1
+      updateSelectInput(session, "pre_week",
+                        choices = week_choices(input$phase), selected = sel)
+    }, ignoreInit = TRUE)
+
+    phase   <- reactive(input$phase %||% "pre")
     week_no <- reactive(as.integer(input$pre_week %||% 1))
-    mult    <- reactive(WEEK_MULTIPLIERS[week_no()])
+    wk      <- reactive(training_week(phase(), week_no()))
 
     output$week_context <- renderUI({
-      wk_start <- PRESEASON_START + (week_no() - 1) * 7
-      cur      <- floor_date(Sys.Date(), "week", week_start = 1)
-      p(class = "small mb-2",
-        style = paste0("color:", AMS_COLORS$primary, ";font-weight:600"),
-        sprintf("%s - %s%s", format(wk_start, "%a %b %d"),
-                format(wk_start + 6, "%a %b %d"),
-                if (identical(as.Date(cur), as.Date(wk_start)))
-                  "  (current week)" else ""))
+      w <- wk()
+      cur <- floor_date(Sys.Date(), "week", week_start = 1)
+      tagList(
+        p(class = "small mb-1",
+          style = paste0("color:", AMS_COLORS$primary, ";font-weight:600"),
+          sprintf("%s - %s%s", format(w$start, "%a %b %d"),
+                  format(w$end, "%a %b %d"),
+                  if (identical(as.Date(cur), as.Date(w$start)))
+                    "  (current week)" else "")),
+        if (identical(w$phase, "in"))
+          p(class = "small mb-2", style = paste0("color:", AMS_COLORS$gold),
+            sprintf("%s · %s · TOF %s", w$focus,
+                    if (is.na(w$saturday)) "no fixture"
+                    else paste("match", format(w$saturday, "%b %d")),
+                    if (is.na(w$tof)) "n/a" else format(round(w$tof))))
+      )
     })
 
     group_progress <- reactive(
-      compute_group_progress(data()$gps, week_no()))
+      compute_group_progress(data()$gps, week_no(), phase = phase()))
 
     # Cohorts actually present in the current data.
     groups_in_data <- reactive({
@@ -101,10 +126,10 @@ mod_weekly_load_server <- function(id, data) {
         filter(position_group %in% groups_in_data()) |>
         transmute(
           Cohort = position_group,
-          `TD (m)` = round(bm_distance * mult()),
-          `HMLD (m)` = round(bm_hmld * mult()),
-          `HSR (m)` = round(bm_hsr * mult()),
-          `A+D (n)` = round(bm_ad * mult())
+          `TD (m)` = round(bm_distance * wk()$m_td),
+          `HMLD (m)` = round(bm_hmld * wk()$m_hmld),
+          `HSR (m)` = round(bm_hsr * wk()$m_hsr),
+          `A+D (n)` = round(bm_ad * wk()$m_ad)
         )
       if (!isTRUE(data()$has_hmld)) fc <- select(fc, -`HMLD (m)`)
       reactable(fc, compact = TRUE, defaultPageSize = 8,
@@ -196,7 +221,8 @@ mod_weekly_load_server <- function(id, data) {
     })
 
     output$athlete_table <- renderReactable({
-      win <- preseason_week_window(week_no())
+      w <- wk()
+      win <- c(w$start, w$end)
       att <- compute_attendance(data()$gps, win)
       wd <- data()$gps |>
         filter(date >= win[1], date <= win[2]) |>
@@ -208,10 +234,10 @@ mod_weekly_load_server <- function(id, data) {
                   .groups = "drop") |>
         left_join(MATCH_BENCHMARKS, by = "position_group") |>
         mutate(
-          pct_td   = 100 * distance / (bm_distance * mult()),
-          pct_hsr  = 100 * hsr / (bm_hsr * mult()),
-          pct_ad   = 100 * ad / (bm_ad * mult()),
-          pct_hmld = 100 * hmld / (bm_hmld * mult())
+          pct_td   = 100 * distance / (bm_distance * w$m_td),
+          pct_hsr  = 100 * hsr / (bm_hsr * w$m_hsr),
+          pct_ad   = 100 * ad / (bm_ad * w$m_ad),
+          pct_hmld = 100 * hmld / (bm_hmld * w$m_hmld)
         ) |>
         left_join(att |> select(athlete_id, sessions_attended,
                                 sessions_possible, attendance,
@@ -268,6 +294,8 @@ mod_weekly_load_server <- function(id, data) {
       )
     })
 
-    week_no   # return reactive for cross-module use (Home briefing)
+    # Home consumes the whole selection so its briefing and bar chart report
+    # against exactly the week shown here.
+    reactive(list(phase = phase(), week = week_no()))
   })
 }
