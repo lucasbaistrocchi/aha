@@ -157,12 +157,52 @@ compute_speed_vaccine <- function(gps, as_of = max(gps$date)) {
 # one row per cohort with accumulated / forecast / remaining / pct for TD,
 # HSR, A+D (combined accel+decel efforts), and HMLD. Consumed by Weekly Load
 # AND Home briefing so both screens always agree.
-# Week windows are strict Monday-Sunday blocks counted from PRESEASON_START
-# (Mon 10 Aug 2026). ALL activity tags count toward accumulated volume --
-# match day and training alike.
+# Week windows are strict Monday-Sunday blocks. Pre-season counts from
+# PRESEASON_START (Mon 10 Aug 2026); in-season resumes the Monday after
+# pre-season week 6 ends (Mon 21 Sep 2026), so the two phases are contiguous
+# with no gap or overlap. ALL activity tags count toward accumulated volume.
 preseason_week_window <- function(week_no) {
   start <- PRESEASON_START + (max(1, week_no) - 1) * 7
   c(start, start + 6)
+}
+
+N_PRE_WEEKS <- function() length(WEEK_MULTIPLIERS)
+N_IN_WEEKS  <- function() nrow(IN_SEASON_PLAN)
+
+# One description of a training week, whichever phase it belongs to: its
+# Mon-Sun window plus the per-metric multipliers its targets are built from.
+# Pre-season applies one scalar to every metric; in-season varies by metric.
+training_week <- function(phase = "pre", week_no = 1) {
+  if (identical(phase, "in")) {
+    week_no <- max(1, min(week_no, N_IN_WEEKS()))
+    r <- IN_SEASON_PLAN[week_no, ]
+    start <- INSEASON_START + (week_no - 1) * 7
+    list(phase = "in", week = week_no, start = start, end = start + 6,
+         label = paste("In-season Week", week_no),
+         focus = r$focus, saturday = r$saturday, tof = r$tof,
+         m_td = r$m_td, m_hmld = r$m_hmld, m_hsr = r$m_hsr, m_ad = r$m_ad)
+  } else {
+    week_no <- max(1, min(week_no, N_PRE_WEEKS()))
+    m <- WEEK_MULTIPLIERS[week_no]
+    start <- PRESEASON_START + (week_no - 1) * 7
+    list(phase = "pre", week = week_no, start = start, end = start + 6,
+         label = paste("Pre-season Week", week_no),
+         focus = sprintf("x%.2f match load", m),
+         saturday = as.Date(NA), tof = NA_real_,
+         m_td = m, m_hmld = m, m_hsr = m, m_ad = m)
+  }
+}
+
+# Which training week contains a given date (defaults to today).
+current_training_week <- function(today = Sys.Date()) {
+  mon <- floor_date(today, "week", week_start = 1)
+  if (mon >= INSEASON_START) {
+    w <- as.integer(as.numeric(mon - INSEASON_START) / 7) + 1
+    list(phase = "in", week = max(1, min(w, N_IN_WEEKS())))
+  } else {
+    w <- as.integer(as.numeric(mon - PRESEASON_START) / 7) + 1
+    list(phase = "pre", week = max(1, min(w, N_PRE_WEEKS())))
+  }
 }
 
 # Attendance for one week: sessions an athlete appears in, over the number of
@@ -201,10 +241,10 @@ compute_attendance <- function(gps, win, min_share = NULL) {
 
 # `include_all = TRUE` ignores the attendance filter (used by views that
 # should show the whole squad regardless).
-compute_group_progress <- function(gps, week_no = 1, include_all = FALSE) {
-  week_no <- max(1, min(week_no, length(WEEK_MULTIPLIERS)))
-  mult <- WEEK_MULTIPLIERS[week_no]
-  win  <- preseason_week_window(week_no)
+compute_group_progress <- function(gps, week_no = 1, include_all = FALSE,
+                                   phase = "pre") {
+  wk   <- training_week(phase, week_no)
+  win  <- c(wk$start, wk$end)
 
   att <- compute_attendance(gps, win)
   n_dates <- if (nrow(att)) att$sessions_possible[1] else 0L
@@ -242,10 +282,12 @@ compute_group_progress <- function(gps, week_no = 1, include_all = FALSE) {
     mutate(
       across(starts_with("acc_"), ~ coalesce(.x, 0)),
       n_excluded = coalesce(n_excluded, 0L),
-      tg_distance = bm_distance * mult * n_athletes,
-      tg_hsr      = bm_hsr      * mult * n_athletes,
-      tg_ad       = bm_ad       * mult * n_athletes,
-      tg_hmld     = bm_hmld     * mult * n_athletes,
+      # Per-metric multipliers: in-season loads A+D harder than running, so
+      # one shared scalar would misstate those targets.
+      tg_distance = bm_distance * wk$m_td   * n_athletes,
+      tg_hsr      = bm_hsr      * wk$m_hsr  * n_athletes,
+      tg_ad       = bm_ad       * wk$m_ad   * n_athletes,
+      tg_hmld     = bm_hmld     * wk$m_hmld * n_athletes,
       rem_distance = pmax(0, tg_distance - acc_distance),
       rem_hsr      = pmax(0, tg_hsr - acc_hsr),
       rem_ad       = pmax(0, tg_ad - acc_ad),
