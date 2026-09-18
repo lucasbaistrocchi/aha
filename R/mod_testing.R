@@ -72,8 +72,9 @@ mod_testing_server <- function(id, data) {
       with_data <- unique(tst$metric)
       avail <- TEST_METRICS |>
         filter(metric %in% cols) |>
-        mutate(lbl = if_else(metric %in% with_data, metric,
-                             paste0(metric, "  (no data yet)")))
+        mutate(disp = test_display_name(metric),
+               lbl = if_else(metric %in% with_data, disp,
+                             paste0(disp, "  (no data yet)")))
       grouped <- lapply(split(avail, factor(avail$group,
                                             levels = unique(avail$group))),
                         function(g) setNames(g$metric, g$lbl))
@@ -100,7 +101,11 @@ mod_testing_server <- function(id, data) {
       if (nrow(m) == 0)
         m <- tibble(metric = input$metric, group = "", unit = "",
                     higher_better = TRUE)
-      m[1, ]
+      m <- m[1, ]
+      # Charts and titles show the coach-facing name; `metric` stays the
+      # sheet column used for joins.
+      m$metric <- test_display_name(m$metric)
+      m
     })
 
     # Values for the selected metric + date (or per-athlete best all-time),
