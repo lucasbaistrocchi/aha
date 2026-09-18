@@ -22,7 +22,12 @@ mod_match_minutes_ui <- function(id) {
                   top-quartile impact/accel load within each match.")
       ),
       card(
-        card_header("Top-up prescriptions (selected match)"),
+        card_header(
+          div(class = paste("d-flex justify-content-between",
+                            "align-items-center gap-2 flex-wrap"),
+              span("Top-up prescriptions (selected match)"),
+              downloadButton(ns("export_topup"), "PDF", class = "btn-sm"))
+        ),
         reactableOutput(ns("topup_table"))
       )
     ),
@@ -38,7 +43,12 @@ mod_match_minutes_ui <- function(id) {
                   substitute what selection is not providing.")
       ),
       card(
-        card_header("Chronic match exposure — cumulative minutes & load"),
+        card_header(
+          div(class = paste("d-flex justify-content-between",
+                            "align-items-center gap-2 flex-wrap"),
+              span("Chronic match exposure — cumulative minutes & load"),
+              downloadButton(ns("export_exposure"), "PDF", class = "btn-sm"))
+        ),
         uiOutput(ns("exposure_ui")),
         reactableOutput(ns("exposure_table"))
       )
@@ -100,6 +110,60 @@ mod_match_minutes_server <- function(id, data) {
       )
     })
 
+    # Label for the selected match, reused by the exports.
+    match_label <- reactive({
+      req(input$match_date)
+      d <- as_date(input$match_date)
+      opp <- matches() |> filter(date == d) |> pull(opponent) |> unique()
+      opp <- opp[!is.na(opp)]
+      paste0(format(d, "%a %b %d, %Y"),
+             if (length(opp)) paste0(" vs ", opp[1]) else "")
+    })
+
+    # ---- PDF: top-up prescriptions for the selected match -------------------
+    output$export_topup <- downloadHandler(
+      filename = function() paste0("topups-", input$match_date, ".pdf"),
+      content = function(file) {
+        d <- match_day() |> arrange(match_minutes)
+        validate(need(nrow(d) > 0, "No athletes in this match."))
+
+        cols <- list(
+          list(label = "ATHLETE", x = 0.00, align = "left"),
+          list(label = "GROUP",   x = 0.24, align = "left"),
+          list(label = "MIN",     x = 0.50, align = "right"),
+          list(label = "IMPACTS", x = 0.60, align = "right"),
+          list(label = "A+D",     x = 0.68, align = "right"),
+          list(label = "TIER",    x = 0.72, align = "left"),
+          list(label = "TUE",     x = 0.99, align = "right"))
+
+        n0 <- function(x) if (is.na(x)) "-" else
+          format(round(x), big.mark = ",")
+        rows <- lapply(seq_len(nrow(d)), function(i) c(
+          d$athlete_name[i], as.character(d$position_group[i]),
+          n0(d$match_minutes[i]), n0(d$contacts[i]),
+          n0(d$accels[i] + coalesce(d$decels[i], 0)),
+          d$tier[i],
+          if (isTRUE(d$reduce_tuesday[i])) "-15%" else "-"))
+
+        colour_fn <- function(i, j) {
+          if (j == 6) return(switch(d$tier[i],
+                                    "High Top-Up" = "#C0392B",
+                                    "Moderate Top-Up" = "#B7950B",
+                                    "#1E8449"))
+          if (j == 7 && isTRUE(d$reduce_tuesday[i])) return("#C0392B")
+          "#222222"
+        }
+
+        grDevices::pdf(file, width = 8.5, height = 11)
+        on.exit(grDevices::dev.off(), add = TRUE)
+        pdf_table(
+          title = "Match Top-Up Prescriptions",
+          subtitle = paste0(match_label(),
+                            "  |  run within 24 h of the match"),
+          cols = cols, rows = rows, colour_fn = colour_fn,
+          note_fn = function(i) d$prescription[i])
+      })
+
     # ---- Longitudinal aggregate (last N matches) -----------------------------
     exposure <- reactive({
       compute_match_aggregate(data()$gps, n_matches = input$n_matches %||% 3)
@@ -153,6 +217,58 @@ mod_match_minutes_server <- function(id, data) {
                   length(match_dates)),
           margin_b = 160)
     })
+
+    # ---- PDF: chronic match exposure ----------------------------------------
+    output$export_exposure <- downloadHandler(
+      filename = function()
+        paste0("match-exposure-last", input$n_matches %||% 3, "-",
+               Sys.Date(), ".pdf"),
+      content = function(file) {
+        d <- exposure()
+        validate(need(nrow(d) > 0, "No match data."))
+        has_h <- isTRUE(data()$has_hmld)
+
+        # Right-aligned numerics end at their x; the trailing left-aligned
+        # TIER must start early enough that "Moderate" still fits on-page.
+        cols <- list(
+          list(label = "ATHLETE",  x = 0.00, align = "left"),
+          list(label = "GROUP",    x = 0.21, align = "left"),
+          list(label = "APPS",     x = 0.42, align = "right"),
+          list(label = "TOT MIN",  x = 0.51, align = "right"),
+          list(label = "MEAN",     x = 0.58, align = "right"),
+          list(label = "EXP %",    x = 0.66, align = "right"),
+          list(label = "DIST",     x = 0.76, align = "right"),
+          list(label = "HSR",      x = 0.84, align = "right"),
+          list(label = "TIER",     x = 0.86, align = "left"))
+
+        n0 <- function(x) if (is.na(x)) "-" else
+          format(round(x), big.mark = ",")
+        rows <- lapply(seq_len(nrow(d)), function(i) c(
+          d$athlete_name[i], as.character(d$position_group[i]),
+          as.character(d$matches_played[i]), n0(d$total_minutes[i]),
+          n0(d$mean_minutes[i]), paste0(round(d$exposure_pct[i]), "%"),
+          n0(d$total_distance[i]), n0(d$total_hsr[i]),
+          sub(" exposure", "", d$exposure_tier[i])))
+
+        # Exposure % and tier carry the on-screen colour meaning: red = high
+        # (manage freshness), gold = low (match-fitness deficit).
+        colour_fn <- function(i, j) {
+          if (!j %in% c(6, 9)) return("#222222")
+          p <- d$exposure_pct[i]
+          if (p >= 75) "#C0392B" else if (p >= 40) "#1E8449" else "#B7950B"
+        }
+
+        grDevices::pdf(file, width = 8.5, height = 11)
+        on.exit(grDevices::dev.off(), add = TRUE)
+        pdf_table(
+          title = "Chronic Match Exposure",
+          subtitle = sprintf(
+            "Last %d matches  |  %d athletes  |  >=75%% = manage freshness, <40%% = match-fitness deficit%s",
+            input$n_matches %||% 3, nrow(d),
+            if (has_h) "" else "  |  HMLD unavailable"),
+          cols = cols, rows = rows, colour_fn = colour_fn,
+          note_fn = function(i) d$implication[i])
+      })
 
     output$exposure_table <- renderReactable({
       tbl <- exposure() |>
