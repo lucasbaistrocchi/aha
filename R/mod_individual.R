@@ -41,7 +41,8 @@ mod_individual_ui <- function(id) {
       col_widths = c(6, 6),
       card(
         card_header("Match output vs cohort benchmark (per-minute)"),
-        plotlyOutput(ns("bench_plot"), height = "300px")
+        plotlyOutput(ns("bench_plot"), height = "300px"),
+        reactableOutput(ns("bench_table"))
       ),
       card(
         card_header("Testing profile — squad percentile"),
@@ -163,12 +164,54 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
         metric = c("Distance", "HSR", "HMLD", "A+D"),
         mine   = c(rate(m$distance), rate(m$hsr_distance), rate(m$hmld),
                    rate(m$accels + coalesce(m$decels, 0))),
+        # The cohort's full-match target, and the per-minute rate it implies.
+        bench_80 = c(bm$bm_distance, bm$bm_hsr, bm$bm_hmld, bm$bm_ad),
         bench  = c(bm$bm_distance, bm$bm_hsr, bm$bm_hmld, bm$bm_ad) /
                    THRESHOLDS$match_full_min
       ) |>
-        mutate(pct = 100 * mine / bench) |>
+        mutate(pct = 100 * mine / bench,
+               # What this athlete's own minutes entitle them to.
+               expected = bench * tot_min,
+               actual = mine * tot_min) |>
         filter(is.finite(pct))
       defs
+    })
+
+    # Spells out the benchmark instead of leaving it implicit in a percentage.
+    output$bench_table <- renderReactable({
+      d <- bench_data()
+      validate(need(nrow(d) > 0, "No match data for this athlete."))
+      tot <- sum(ath_matches()$match_minutes, na.rm = TRUE)
+
+      tbl <- d |>
+        transmute(
+          Metric = metric,
+          `Your /min` = round(mine, 2),
+          `Bench /min` = round(bench, 2),
+          `80-min bench` = round(bench_80),
+          `Your total` = round(actual),
+          Expected = round(expected),
+          `%` = round(pct)
+        )
+      # Name the column after the athlete's actual minutes so the comparison
+      # is unambiguous.
+      names(tbl)[names(tbl) == "Expected"] <-
+        sprintf("Expected (%d min)", round(tot))
+
+      reactable(
+        tbl, compact = TRUE, defaultPageSize = 5,
+        defaultColDef = colDef(format = colFormat(separators = TRUE)),
+        columns = list(
+          Metric = colDef(style = list(fontWeight = 600), width = 90),
+          `%` = colDef(width = 70, cell = function(value) paste0(value, "%"),
+                       style = function(value) {
+                         col <- if (value >= 100) AMS_COLORS$primary
+                                else if (value >= 80) NULL else AMS_COLORS$gold
+                         list(color = col, fontWeight = 700)
+                       })
+        ),
+        theme = ams_react_theme
+      )
     })
 
     output$bench_plot <- renderPlotly({
@@ -238,7 +281,10 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
                 pct >= 75 ~ AMS_COLORS$primary,
                 pct >= 40 ~ AMS_COLORS$gold,
                 TRUE      ~ AMS_COLORS$red)),
-              text = ~sprintf("%.0f", value), textposition = "outside",
+              # Significant-digit aware: "%.0f" turned a 0.34 m jump into
+              # "0". Jump height is now read in cm, but small-valued tests
+              # still need decimals.
+              text = ~fmt_metric_value(value), textposition = "outside",
               cliponaxis = FALSE,
               hovertemplate = paste0("%{y}<br>value %{text}",
                                      "<br>%{x:.0f}th pct<extra></extra>")) |>
