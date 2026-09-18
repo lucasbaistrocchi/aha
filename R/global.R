@@ -495,6 +495,16 @@ pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
        adj = c(0, 0), cex = 0.62, col = "#888888")
 }
 
+# Format a test value with enough significant digits to be meaningful:
+# 4388 -> "4388", 34.2 -> "34.2", 0.34 -> "0.34". A fixed "%.0f" silently
+# turns every sub-1 measurement into "0".
+fmt_metric_value <- function(x) {
+  ifelse(is.na(x), "-",
+    ifelse(abs(x) >= 1000, formatC(x, format = "f", digits = 0, big.mark = ","),
+      ifelse(abs(x) >= 100, sprintf("%.0f", x),
+        ifelse(abs(x) >= 10, sprintf("%.1f", x), sprintf("%.2f", x)))))
+}
+
 status_badge <- function(color, label) {
   rgb <- grDevices::col2rgb(color)
   lum <- (0.299 * rgb[1] + 0.587 * rgb[2] + 0.114 * rgb[3]) / 255
