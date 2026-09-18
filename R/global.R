@@ -121,6 +121,69 @@ WEEK_MULTIPLIERS <- tryCatch({
   m
 }, error = function(e) WEEK_MULTIPLIERS_DEFAULT)
 
+# ------------------------------------------------------------------------------
+# IN-SEASON PERIODIZATION ('In-Season Load' sheet)
+# ------------------------------------------------------------------------------
+# In-season differs from pre-season in one important way: each week carries a
+# DIFFERENT multiplier PER METRIC, not one scalar for everything. A normal
+# week is x2.65 of match load for TD and HMLD but x2.56 HSR and x2.99 A+D --
+# the plan deliberately loads collision/effort work harder than running. A
+# single scalar would understate A+D targets by ~13%.
+#
+# Multipliers are recovered the same way the workbook builds its own
+# per-position blocks: metric multiplier = (sheet's Avg for that metric) /
+# (mean Target Match Load for that metric). Verified to reproduce the
+# workbook's per-position numbers exactly.
+INSEASON_START <- as.Date("2026-09-21")   # Mon after pre-season week 6 ends
+
+IN_SEASON_PLAN_DEFAULT <- tibble::tribble(
+  ~week, ~dates,          ~focus,                  ~scalar, ~m_td,  ~m_hmld, ~m_hsr, ~m_ad,  ~tof,
+  1L,  "9/21 - 9/27",   "Normal load",           1.00, 2.6500, 2.6500, 2.5600, 2.9900, 300,
+  2L,  "9/28 - 10/4",   "Normal load",           0.96, 2.5840, 2.5840, 2.4976, 2.9104, 300,
+  3L,  "10/5 - 10/11",  "PEAK - taper",          1.00, 2.3000, 2.3000, 2.2400, 2.5300, 265,
+  4L,  "10/12 - 10/18", "Reload",                1.00, 2.6500, 2.6500, 2.5600, 2.9900, 300,
+  5L,  "10/19 - 10/25", "DELOAD - recovery",     1.00, 1.3200, 1.3600, 1.3000, 1.5800, 175,
+  6L,  "10/26 - 11/1",  "Normal load",           1.00, 2.6500, 2.6500, 2.5600, 2.9900, 300,
+  7L,  "11/2 - 11/8",   "Pre-taper",             0.93, 2.5345, 2.5345, 2.4508, 2.8507, 300,
+  8L,  "11/9 - 11/15",  "PEAK - taper",          1.00, 2.3000, 2.3000, 2.2400, 2.5300, 265,
+  9L,  "11/16 - 11/22", "Reload",                0.97, 2.6005, 2.6005, 2.5132, 2.9303, 300,
+  10L, "11/23 - 11/29", "DELOAD - Thanksgiving", 1.00, 1.3800, 1.4400, 1.3700, 1.7000, 185,
+  11L, "11/30 - 12/6",  "PEAK - taper",          1.00, 2.3000, 2.3000, 2.2400, 2.5300, 265
+) |>
+  mutate(saturday = as.Date(c("2026-09-26", "2026-10-03", "2026-10-10",
+                              "2026-10-17", NA, "2026-10-31", "2026-11-07",
+                              "2026-11-14", "2026-11-21", NA, "2026-12-05")))
+
+IN_SEASON_PLAN <- tryCatch({
+  raw <- readxl::read_excel(FORECAST_XLSX, sheet = "In-Season Load",
+                            range = "G3:P14")
+  stopifnot(nrow(raw) == 11)
+  chr <- function(x) vapply(x, function(v)
+    if (length(v) == 0 || is.na(v[1])) NA_character_ else as.character(v[1]),
+    character(1))
+  sat_raw <- raw[[3]]
+  sat <- suppressWarnings(as.Date(chr(sat_raw)))   # "BYE"/"OFF" -> NA
+
+  base <- c(mean(TARGET_MATCH_LOAD$td),   mean(TARGET_MATCH_LOAD$hmld),
+            mean(TARGET_MATCH_LOAD$hsr),  mean(TARGET_MATCH_LOAD$a_d))
+  avg <- lapply(6:9, function(i) as.numeric(raw[[i]]))
+
+  out <- tibble(
+    week   = as.integer(sub("\\D+", "", chr(raw[[1]]))),
+    dates  = chr(raw[[2]]),
+    saturday = sat,
+    focus  = chr(raw[[4]]),
+    scalar = as.numeric(raw[[5]]),
+    m_td   = avg[[1]] / base[1],
+    m_hmld = avg[[2]] / base[2],
+    m_hsr  = avg[[3]] / base[3],
+    m_ad   = avg[[4]] / base[4],
+    tof    = as.numeric(raw[[10]])
+  )
+  stopifnot(!anyNA(out$m_td), all(out$m_td > 0))
+  out
+}, error = function(e) IN_SEASON_PLAN_DEFAULT)
+
 # Position -> cohort mapping. Cohort benchmark = mean of member positions.
 # Forwards/Backs are the coarse cohorts used while the GPS sheet only labels
 # Forwards/Backs (upload data/roster.csv to unlock the six-cohort model).
