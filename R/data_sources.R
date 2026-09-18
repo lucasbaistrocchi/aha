@@ -196,7 +196,15 @@ canonical_name <- function(x) {
 
 fetch_gps_sheet <- function() {
   ensure_sheet_auth()  # reads work anon or authed; never drop a service-account session
-  raw <- read_sheet(gps_sheet_id(), .name_repair = "unique")
+  # col_types = "c" reads EVERY column as text and lets num()/dur_to_min()
+  # do the conversion. Without it, read_sheet() guesses each column's type
+  # from the first ~1000 rows -- and match-only columns like "Mins Played"
+  # are blank in all of those (minutes exist on ~20 match rows out of
+  # ~1800), so the column is typed logical and every real value is silently
+  # dropped to NA. Distance survives because it is populated on every row,
+  # which is why minutes alone came through as zero.
+  raw <- read_sheet(gps_sheet_id(), .name_repair = "unique",
+                    col_types = "c")
 
   num <- function(x) suppressWarnings(as.numeric(as.character(x)))
 
@@ -354,7 +362,10 @@ has_wellness_sheet <- function() nzchar(wellness_sheet_id())
 
 fetch_wellness <- function() {
   ensure_sheet_auth()  # reads work anon or authed
-  raw <- read_sheet(wellness_sheet_id(), sheet = WELLNESS_TAB)
+  # Text-in, convert-ourselves: same type-guessing hazard as the other sheets
+  # (ATC notes and severity are sparsely filled).
+  raw <- read_sheet(wellness_sheet_id(), sheet = WELLNESS_TAB,
+                    col_types = "c")
 
   # Rename by pattern, not position -- survives column reordering in the Form.
   raw |>
@@ -457,7 +468,11 @@ REPORT_METRICS <- tibble::tribble(
 
 fetch_testing <- function() {
   ensure_sheet_auth()  # reads work anon or authed
-  raw <- read_sheet(testing_sheet_id(), .name_repair = "unique")
+  # Read as text for the same reason as the GPS sheet: a test column that is
+  # sparsely populated (Bronco, sprint times) would otherwise be type-guessed
+  # as logical and its values thrown away.
+  raw <- read_sheet(testing_sheet_id(), .name_repair = "unique",
+                    col_types = "c")
   names(raw) <- str_squish(names(raw))
 
   name_col <- names(raw)[str_detect(names(raw),
