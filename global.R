@@ -49,11 +49,18 @@ THRESHOLDS <- list(
   vaccine_yellow  = 7,      # 6-7 days                 -> Yellow, >7 -> Red
   wellness_z_flag = -1.5,   # rolling z below this = red-flag athlete
   soreness_severe = 7,      # >=7 on the Form's 1-10 scale (10 = worst)
-  wow_jump_pct    = 0.20,   # >20% week-over-week jump flag (pre-season)
+  wow_jump_pct    = 0.20,   # within +/-20% WoW = acceptable progression
+  wow_watch_pct   = 0.40,   # +/-20-40% = monitor; beyond 40% = red
   acwr_high       = 1.5,    # classic "danger" ceiling
   acwr_low        = 0.8,    # under-training floor
   match_full_min  = 80      # rugby union match duration for MD benchmarks
 )
+
+# Minimum share of a week's sessions an athlete must attend before their load
+# counts toward the COHORT target aggregation. Partial attendance is an
+# availability story, not a prescription story; individual breakdowns still
+# show everyone.
+ATTENDANCE_MIN <- 0.70
 
 # ------------------------------------------------------------------------------
 # 2. RUGBY UNION POSITIONAL COHORTS & TARGETS (from the master database xlsx)
@@ -114,6 +121,69 @@ WEEK_MULTIPLIERS <- tryCatch({
   stopifnot(length(m) == 6, !anyNA(m))
   m
 }, error = function(e) WEEK_MULTIPLIERS_DEFAULT)
+
+# ------------------------------------------------------------------------------
+# IN-SEASON PERIODIZATION ('In-Season Load' sheet)
+# ------------------------------------------------------------------------------
+# In-season differs from pre-season in one important way: each week carries a
+# DIFFERENT multiplier PER METRIC, not one scalar for everything. A normal
+# week is x2.65 of match load for TD and HMLD but x2.56 HSR and x2.99 A+D --
+# the plan deliberately loads collision/effort work harder than running. A
+# single scalar would understate A+D targets by ~13%.
+#
+# Multipliers are recovered the same way the workbook builds its own
+# per-position blocks: metric multiplier = (sheet's Avg for that metric) /
+# (mean Target Match Load for that metric). Verified to reproduce the
+# workbook's per-position numbers exactly.
+INSEASON_START <- as.Date("2026-09-21")   # Mon after pre-season week 6 ends
+
+IN_SEASON_PLAN_DEFAULT <- tibble::tribble(
+  ~week, ~dates,          ~focus,                  ~scalar, ~m_td,  ~m_hmld, ~m_hsr, ~m_ad,  ~tof,
+  1L,  "9/21 - 9/27",   "Normal load",           1.00, 2.6500, 2.6500, 2.5600, 2.9900, 300,
+  2L,  "9/28 - 10/4",   "Normal load",           0.96, 2.5840, 2.5840, 2.4976, 2.9104, 300,
+  3L,  "10/5 - 10/11",  "PEAK - taper",          1.00, 2.3000, 2.3000, 2.2400, 2.5300, 265,
+  4L,  "10/12 - 10/18", "Reload",                1.00, 2.6500, 2.6500, 2.5600, 2.9900, 300,
+  5L,  "10/19 - 10/25", "DELOAD - recovery",     1.00, 1.3200, 1.3600, 1.3000, 1.5800, 175,
+  6L,  "10/26 - 11/1",  "Normal load",           1.00, 2.6500, 2.6500, 2.5600, 2.9900, 300,
+  7L,  "11/2 - 11/8",   "Pre-taper",             0.93, 2.5345, 2.5345, 2.4508, 2.8507, 300,
+  8L,  "11/9 - 11/15",  "PEAK - taper",          1.00, 2.3000, 2.3000, 2.2400, 2.5300, 265,
+  9L,  "11/16 - 11/22", "Reload",                0.97, 2.6005, 2.6005, 2.5132, 2.9303, 300,
+  10L, "11/23 - 11/29", "DELOAD - Thanksgiving", 1.00, 1.3800, 1.4400, 1.3700, 1.7000, 185,
+  11L, "11/30 - 12/6",  "PEAK - taper",          1.00, 2.3000, 2.3000, 2.2400, 2.5300, 265
+) |>
+  mutate(saturday = as.Date(c("2026-09-26", "2026-10-03", "2026-10-10",
+                              "2026-10-17", NA, "2026-10-31", "2026-11-07",
+                              "2026-11-14", "2026-11-21", NA, "2026-12-05")))
+
+IN_SEASON_PLAN <- tryCatch({
+  raw <- readxl::read_excel(FORECAST_XLSX, sheet = "In-Season Load",
+                            range = "G3:P14")
+  stopifnot(nrow(raw) == 11)
+  chr <- function(x) vapply(x, function(v)
+    if (length(v) == 0 || is.na(v[1])) NA_character_ else as.character(v[1]),
+    character(1))
+  sat_raw <- raw[[3]]
+  sat <- suppressWarnings(as.Date(chr(sat_raw)))   # "BYE"/"OFF" -> NA
+
+  base <- c(mean(TARGET_MATCH_LOAD$td),   mean(TARGET_MATCH_LOAD$hmld),
+            mean(TARGET_MATCH_LOAD$hsr),  mean(TARGET_MATCH_LOAD$a_d))
+  avg <- lapply(6:9, function(i) as.numeric(raw[[i]]))
+
+  out <- tibble(
+    week   = as.integer(sub("\\D+", "", chr(raw[[1]]))),
+    dates  = chr(raw[[2]]),
+    saturday = sat,
+    focus  = chr(raw[[4]]),
+    scalar = as.numeric(raw[[5]]),
+    m_td   = avg[[1]] / base[1],
+    m_hmld = avg[[2]] / base[2],
+    m_hsr  = avg[[3]] / base[3],
+    m_ad   = avg[[4]] / base[4],
+    tof    = as.numeric(raw[[10]])
+  )
+  stopifnot(!anyNA(out$m_td), all(out$m_td > 0))
+  out
+}, error = function(e) IN_SEASON_PLAN_DEFAULT)
 
 # Position -> cohort mapping. Cohort benchmark = mean of member positions.
 # Forwards/Backs are the coarse cohorts used while the GPS sheet only labels
@@ -355,6 +425,102 @@ status_colour <- function(s, print = FALSE) {
   if (!identical(s, "Full Participation"))
     return(if (print) "#B7950B" else AMS_COLORS$gold)
   if (print) "#1E8449" else AMS_COLORS$primary
+}
+
+# ------------------------------------------------------------------------------
+# PDF helpers (base graphics -- no pandoc / headless browser dependency)
+# ------------------------------------------------------------------------------
+# Base pdf() is ASCII territory: transliterate before drawing.
+pdf_ascii <- function(x) {
+  x <- gsub("≥", ">=", x); x <- gsub("≤", "<=", x)
+  x <- gsub("—", "-", x);  x <- gsub("–", "-", x)
+  x <- gsub("·", "|", x);  x <- gsub("Δ", "d", x)
+  iconv(x, to = "ASCII//TRANSLIT", sub = "")
+}
+
+# Draw a simple table on an open pdf() page, paginating as needed.
+# `cols` = named list(label, x, align) ; `rows` = list of character vectors.
+# `colour_fn(row_i, col_j)` optionally returns a colour per cell.
+# `note_fn(i)` optionally returns a longer string for row i (a prescription,
+# an action) drawn wrapped in smaller grey type beneath that row; row height
+# grows to fit, and pagination accounts for it.
+pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
+                      row_h = 0.019, note_fn = NULL, note_x = 0.04,
+                      note_width = 105) {
+  draw_head <- function() {
+    par(mar = c(0.4, 0.6, 0.4, 0.6))
+    plot.new(); plot.window(xlim = c(0, 1), ylim = c(0, 1))
+    y <- 0.98
+    text(0, y, pdf_ascii(title), adj = c(0, 1), cex = 1.3, font = 2)
+    y <- y - 0.026
+    if (nzchar(subtitle)) {
+      text(0, y, pdf_ascii(subtitle), adj = c(0, 1), cex = 0.88,
+           col = "#444444")
+      y <- y - 0.024
+    }
+    for (cl in cols)
+      text(cl$x, y, cl$label, adj = c(if (identical(cl$align, "right")) 1
+                                      else 0, 1),
+           cex = 0.72, font = 2, col = "#666666")
+    y <- y - 0.010
+    segments(0, y, 1, y, col = "#333333", lwd = 1.4)
+    y - 0.014
+  }
+
+  y <- draw_head()
+  for (i in seq_along(rows)) {
+    note <- if (!is.null(note_fn)) pdf_ascii(note_fn(i) %||% "") else ""
+    wrapped <- if (nzchar(trimws(note)))
+      strwrap(note, width = note_width) else character(0)
+    need <- row_h + length(wrapped) * 0.0145
+    if (y - need < 0.04) y <- draw_head()
+
+    vals <- rows[[i]]
+    for (j in seq_along(cols)) {
+      cl <- cols[[j]]
+      col <- if (!is.null(colour_fn)) colour_fn(i, j) else "#222222"
+      text(cl$x, y, pdf_ascii(vals[j]),
+           adj = c(if (identical(cl$align, "right")) 1 else 0, 1),
+           cex = 0.76, col = col %||% "#222222")
+    }
+    yy <- y - row_h + 0.004
+    for (w in wrapped) {
+      text(note_x, yy, w, adj = c(0, 1), cex = 0.66, col = "#555555")
+      yy <- yy - 0.0145
+    }
+    y <- y - need
+    segments(0, y + 0.006, 1, y + 0.006, col = "#DDDDDD", lwd = 0.4)
+  }
+  text(0, 0.02, pdf_ascii(paste("Life University Rugby AMS  |  generated",
+                                format(Sys.Date(), "%b %d, %Y"))),
+       adj = c(0, 0), cex = 0.62, col = "#888888")
+}
+
+# Format a test value with enough significant digits to be meaningful:
+# 4388 -> "4388", 34.2 -> "34.2", 0.34 -> "0.34". A fixed "%.0f" silently
+# turns every sub-1 measurement into "0".
+fmt_metric_value <- function(x) {
+  ifelse(is.na(x), "-",
+    ifelse(abs(x) >= 1000, formatC(x, format = "f", digits = 0, big.mark = ","),
+      ifelse(abs(x) >= 100, sprintf("%.0f", x),
+        ifelse(abs(x) >= 10, sprintf("%.1f", x), sprintf("%.2f", x)))))
+}
+
+# Week-over-week change banding, on MAGNITUDE of change in either direction
+# -- a 45% drop is as much a planning signal as a 45% spike.
+#   |d| <= 20%        OK       (normal progression)
+#   20% < |d| <= 40%  MONITOR
+#   |d| >  40%        HIGH
+# `pct` is in percent units (e.g. 23.4), not a proportion.
+wow_band <- function(pct) {
+  lim1 <- THRESHOLDS$wow_jump_pct * 100
+  lim2 <- THRESHOLDS$wow_watch_pct * 100
+  a <- abs(pct)
+  if (length(a) == 0 || is.na(a))
+    return(list(label = "—", colour = AMS_COLORS$grey))
+  if (a <= lim1) return(list(label = "OK", colour = AMS_COLORS$green))
+  if (a <= lim2) return(list(label = "MONITOR", colour = AMS_COLORS$gold))
+  list(label = "HIGH", colour = AMS_COLORS$red)
 }
 
 status_badge <- function(color, label) {
