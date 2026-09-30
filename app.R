@@ -218,7 +218,10 @@ server <- function(input, output, session) {
         paste(name, if (isTRUE(ok)) "LIVE" else "DEMO"))
       div(class = "d-flex align-items-center px-2",
           lbl(live["gps"], "GPS"), lbl(live["wellness"], "Wellness"),
-          lbl(live["testing"], "Testing"))
+          lbl(live["testing"], "Testing"),
+          span(class = "ms-2", style = "font-size:0.68rem;color:#8A8A8A",
+               title = paste("Build", app_build_time()),
+               APP_VERSION))
     })
   })
 }
