@@ -30,6 +30,22 @@ suppressPackageStartupMessages({
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 
 # ------------------------------------------------------------------------------
+# BUILD STAMP
+# ------------------------------------------------------------------------------
+# Shown in the navbar. Bump APP_VERSION whenever code changes ship, so it is
+# immediately obvious whether a deployment is actually running the new code
+# or an older cached build -- otherwise "I republished but nothing changed"
+# is indistinguishable from "the change didn't work".
+APP_VERSION <- "2026-09-29 · cohort percentiles + WoW bands"
+
+app_build_time <- function() {
+  fs <- c("app.R", list.files("R", full.names = TRUE, pattern = "\\.R$"))
+  fs <- fs[file.exists(fs)]
+  if (!length(fs)) return("")
+  format(max(file.mtime(fs)), "%b %d %H:%M")
+}
+
+# ------------------------------------------------------------------------------
 # 1. METRIC THRESHOLDS (operational definitions)
 # ------------------------------------------------------------------------------
 # HSR      : >5.0 m/s (18 km/h). Absolute band -> forwards vs backs comparable.
@@ -49,7 +65,8 @@ THRESHOLDS <- list(
   vaccine_yellow  = 7,      # 6-7 days                 -> Yellow, >7 -> Red
   wellness_z_flag = -1.5,   # rolling z below this = red-flag athlete
   soreness_severe = 7,      # >=7 on the Form's 1-10 scale (10 = worst)
-  wow_jump_pct    = 0.20,   # >20% week-over-week jump flag (pre-season)
+  wow_jump_pct    = 0.20,   # within +/-20% WoW = acceptable progression
+  wow_watch_pct   = 0.40,   # +/-20-40% = monitor; beyond 40% = red
   acwr_high       = 1.5,    # classic "danger" ceiling
   acwr_low        = 0.8,    # under-training floor
   match_full_min  = 80      # rugby union match duration for MD benchmarks
@@ -503,6 +520,23 @@ fmt_metric_value <- function(x) {
     ifelse(abs(x) >= 1000, formatC(x, format = "f", digits = 0, big.mark = ","),
       ifelse(abs(x) >= 100, sprintf("%.0f", x),
         ifelse(abs(x) >= 10, sprintf("%.1f", x), sprintf("%.2f", x)))))
+}
+
+# Week-over-week change banding, on MAGNITUDE of change in either direction
+# -- a 45% drop is as much a planning signal as a 45% spike.
+#   |d| <= 20%        OK       (normal progression)
+#   20% < |d| <= 40%  MONITOR
+#   |d| >  40%        HIGH
+# `pct` is in percent units (e.g. 23.4), not a proportion.
+wow_band <- function(pct) {
+  lim1 <- THRESHOLDS$wow_jump_pct * 100
+  lim2 <- THRESHOLDS$wow_watch_pct * 100
+  a <- abs(pct)
+  if (length(a) == 0 || is.na(a))
+    return(list(label = "—", colour = AMS_COLORS$grey))
+  if (a <= lim1) return(list(label = "OK", colour = AMS_COLORS$green))
+  if (a <= lim2) return(list(label = "MONITOR", colour = AMS_COLORS$gold))
+  list(label = "HIGH", colour = AMS_COLORS$red)
 }
 
 status_badge <- function(color, label) {
