@@ -20,10 +20,6 @@ mod_longitudinal_ui <- function(id) {
         selectInput(ns("athlete"), "Athlete or position group",
                     choices = NULL),
         selectInput(ns("load_metric"), "Load metric", choices = NULL),
-        checkboxInput(ns("preseason"),
-                      sprintf("Pre-season mode (flag >%d%% WoW jumps)",
-                              round(THRESHOLDS$wow_jump_pct * 100)),
-                      value = TRUE),
         helpText("ACWR shaded band = 0.8-1.5 'sweet spot'. Treat excursions
                   as conversation starters, not verdicts — context (travel,
                   academics, injury history) always outranks the ratio.")
@@ -44,6 +40,15 @@ mod_longitudinal_ui <- function(id) {
     ),
     card(
       card_header("Week-over-week load progression (squad)"),
+      p(class = "text-muted small mb-1",
+        sprintf(paste("Banded on the size of the change in either direction:",
+                      "OK within ±%d%%, MONITOR ±%d-%d%%, HIGH beyond ±%d%%.",
+                      "A sharp drop matters as much as a spike — planned",
+                      "deloads will read MONITOR or HIGH by design."),
+                round(THRESHOLDS$wow_jump_pct * 100),
+                round(THRESHOLDS$wow_jump_pct * 100),
+                round(THRESHOLDS$wow_watch_pct * 100),
+                round(THRESHOLDS$wow_watch_pct * 100))),
       reactableOutput(ns("wow_table"))
     )
   )
@@ -250,29 +255,32 @@ mod_longitudinal_server <- function(id, data) {
 
     output$wow_table <- renderReactable({
       req(input$load_metric)
-      preseason <- input$preseason   # reactive dep captured before cell fns
       wow <- compute_wow_change(data()$gps, load_col = input$load_metric) |>
         filter(week == max(week) | week == max(week) - 7) |>
         filter(week == max(week)) |>
         mutate(wow_pct = round(100 * wow_pct, 1)) |>
-        arrange(desc(wow_pct)) |>
+        arrange(desc(abs(wow_pct))) |>   # biggest movers, either direction
         select(Athlete = athlete_name, Group = position_group,
-               `Weekly load` = weekly_load, `WoW %` = wow_pct,
-               Flag = wow_flag)
+               `Weekly load` = weekly_load, `WoW %` = wow_pct) |>
+        # Status carries the same number; the cell renderer turns it into a
+        # band so the column has real data behind it.
+        mutate(Status = `WoW %`)
 
       reactable(
         wow, compact = TRUE, striped = TRUE, defaultPageSize = 20,
         columns = list(
           `Weekly load` = colDef(format = colFormat(separators = TRUE)),
-          `WoW %` = colDef(cell = function(value) {
-            if (is.na(value)) "—" else sprintf("%+.1f%%", value)
-          }),
-          Flag = colDef(cell = function(value) {
-            if (isTRUE(value) && isTRUE(preseason))
-              status_badge(AMS_COLORS$red,
-                           sprintf(">%d%% jump",
-                                   round(THRESHOLDS$wow_jump_pct * 100)))
-            else status_badge(AMS_COLORS$green, "OK")
+          `WoW %` = colDef(
+            cell = function(value) {
+              if (is.na(value)) "—" else sprintf("%+.1f%%", value)
+            },
+            style = function(value) {
+              list(color = wow_band(value)$colour, fontWeight = 700)
+            }),
+          # Banded on MAGNITUDE, so a large drop is surfaced as well.
+          Status = colDef(width = 110, cell = function(value) {
+            b <- wow_band(value)
+            status_badge(b$colour, b$label)
           })
         ),
         theme = ams_react_theme
