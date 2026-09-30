@@ -30,6 +30,22 @@ suppressPackageStartupMessages({
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 
 # ------------------------------------------------------------------------------
+# BUILD STAMP
+# ------------------------------------------------------------------------------
+# Shown in the navbar. Bump APP_VERSION whenever code changes ship, so it is
+# immediately obvious whether a deployment is actually running the new code
+# or an older cached build -- otherwise "I republished but nothing changed"
+# is indistinguishable from "the change didn't work".
+APP_VERSION <- "2026-09-29 · cohort percentiles + WoW bands"
+
+app_build_time <- function() {
+  fs <- c("app.R", list.files("R", full.names = TRUE, pattern = "\\.R$"))
+  fs <- fs[file.exists(fs)]
+  if (!length(fs)) return("")
+  format(max(file.mtime(fs)), "%b %d %H:%M")
+}
+
+# ------------------------------------------------------------------------------
 # 1. METRIC THRESHOLDS (operational definitions)
 # ------------------------------------------------------------------------------
 # HSR      : >5.0 m/s (18 km/h). Absolute band -> forwards vs backs comparable.
