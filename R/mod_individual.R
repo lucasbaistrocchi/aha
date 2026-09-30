@@ -45,7 +45,7 @@ mod_individual_ui <- function(id) {
         reactableOutput(ns("bench_table"))
       ),
       card(
-        card_header("Testing profile — squad percentile"),
+        card_header(uiOutput(ns("test_header"))),
         plotlyOutput(ns("test_plot"), height = "300px")
       )
     ),
@@ -241,19 +241,24 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
       req(nrow(tst) > 0)
       rm <- data()$roster |> distinct(athlete_name, position_group)
 
-      # Latest session per athlete-metric (real Date ordering; NA dates last),
-      # then percentile within squad.
+      # Latest session per athlete-metric (real Date ordering; NA dates last).
       latest <- tst |>
         group_by(athlete_name, metric) |>
         arrange(test_date, .by_group = TRUE) |>
         slice_tail(n = 1) |>
         ungroup() |>
-        left_join(TEST_METRICS, by = "metric")
+        left_join(TEST_METRICS, by = "metric") |>
+        left_join(rm, by = "athlete_name")
+
+      # Rank WITHIN the athlete's own positional cohort: a prop's squat
+      # against the squad says more about his position than his strength.
+      my_cohort <- ath_info()$cohort
 
       latest |>
-        # Report shows a fixed, comparable panel of tests -- not whatever
-        # happens to rank highest for this athlete.
-        filter(metric %in% REPORT_METRICS$metric) |>
+        # Fixed, comparable panel of tests -- not whatever happens to rank
+        # highest for this athlete.
+        filter(metric %in% REPORT_METRICS$metric,
+               !is.na(position_group), position_group == my_cohort) |>
         group_by(metric) |>
         mutate(
           n_ok = sum(!is.na(value)),
@@ -262,14 +267,24 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
           pct = if_else(coalesce(higher_better, TRUE), pct, 100 - pct)
         ) |>
         ungroup() |>
-        filter(athlete_name == input$athlete, !is.na(pct)) |>
+        # A percentile drawn from one or two tested cohort-mates is noise.
+        filter(athlete_name == input$athlete, !is.na(pct), n_ok >= 3) |>
         left_join(REPORT_METRICS, by = "metric")
+    })
+
+    output$test_header <- renderUI({
+      span(paste0("Testing profile — ",
+                  tryCatch(ath_info()$cohort, error = function(e) "cohort"),
+                  " percentile"))
     })
 
     output$test_plot <- renderPlotly({
       d <- test_data()
-      validate(need(nrow(d) > 0,
-                    "No performance testing data for this athlete."))
+      validate(need(nrow(d) > 0, paste(
+        "No cohort percentiles available for this athlete — either no",
+        "testing results, or fewer than 3 tested athletes in their",
+        "position group for these tests.")))
+      n_cohort <- max(d$n_ok, na.rm = TRUE)
       test_day <- suppressWarnings(max(d$test_date, na.rm = TRUE))
       # Fixed display order; reversed so the first listed test sits on top.
       ord <- rev(REPORT_METRICS$label[REPORT_METRICS$label %in% d$label])
@@ -288,8 +303,9 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
               cliponaxis = FALSE,
               hovertemplate = paste0("%{y}<br>value %{text}",
                                      "<br>%{x:.0f}th pct<extra></extra>")) |>
-        layout(xaxis = list(title = "Squad percentile", range = c(0, 122),
-                            automargin = TRUE),
+        layout(xaxis = list(title = sprintf("%s percentile (n=%d)",
+                                            ath_info()$cohort, n_cohort),
+                            range = c(0, 122), automargin = TRUE),
                yaxis = list(title = "", tickfont = list(size = 10),
                             automargin = TRUE),
                shapes = list(list(
@@ -297,7 +313,8 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
                  y1 = nrow(d) - 0.5,
                  line = list(dash = "dot", color = AMS_COLORS$grey)))) |>
         ams_plotly_layout(sprintf(
-          "Testing percentiles%s (dotted = squad median)",
+          "Testing percentiles vs %s%s (dotted = cohort median)",
+          ath_info()$cohort,
           if (is.finite(test_day))
             paste0(" — ", test_date_label(test_day)) else ""),
           margin_l = 130)
@@ -629,7 +646,8 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
         # Testing percentiles (left) + cohort radar (right, same band)
         y <- y - 0.014
         band_top <- y
-        y <- sec(y, "PERFORMANCE TESTING - SQUAD PERCENTILE")
+        y <- sec(y, paste0("PERFORMANCE TESTING - ",
+                           toupper(ascii(info$cohort)), " PERCENTILE"))
         if (nrow(td) > 0) {
           # Same fixed order as the on-screen chart.
           tp <- td |>
