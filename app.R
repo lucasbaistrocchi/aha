@@ -216,12 +216,22 @@ server <- function(input, output, session) {
         style = paste0("background:",
                        if (isTRUE(ok)) AMS_COLORS$green else AMS_COLORS$grey),
         paste(name, if (isTRUE(ok)) "LIVE" else "DEMO"))
+      # The stamp is a diagnostic, so it must never be able to break the
+      # badges it sits next to. If R/global.R on the server is older than
+      # app.R these objects won't exist -- say so plainly instead of
+      # erroring, because that mismatch is exactly what the stamp is for.
+      stamp <- tryCatch(
+        if (exists("APP_VERSION")) APP_VERSION else "version: global.R stale",
+        error = function(e) "version: unavailable")
+      built <- tryCatch(
+        if (exists("app_build_time")) app_build_time() else "",
+        error = function(e) "")
+
       div(class = "d-flex align-items-center px-2",
           lbl(live["gps"], "GPS"), lbl(live["wellness"], "Wellness"),
           lbl(live["testing"], "Testing"),
           span(class = "ms-2", style = "font-size:0.68rem;color:#8A8A8A",
-               title = paste("Build", app_build_time()),
-               APP_VERSION))
+               title = paste("Build", built), stamp))
     })
   })
 }
