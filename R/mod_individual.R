@@ -547,45 +547,57 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
         par(mar = c(0, 0, 0, 0))
         plot.new(); plot.window(xlim = c(0, 1), ylim = c(0, 1))
 
-        # Header
-        y <- 0.97
-        text(0.03, y, ascii(info$name), adj = c(0, 1), cex = 1.9, font = 2)
-        y <- y - 0.032
-        text(0.03, y, sprintf("%s  |  Top speed %s m/s  |  %d matches, %d min",
-                              ascii(info$cohort),
-                              if (is.finite(info$vmax))
-                                sprintf("%.2f", info$vmax) else "n/a",
-                              nrow(m),
-                              round(sum(m$match_minutes, na.rm = TRUE))),
-             adj = c(0, 1), cex = 0.95, col = "#444444")
-        y <- y - 0.012
-        segments(0.03, y, 0.97, y, col = "#222222", lwd = 2)
-
-        sec <- function(y, title) {
-          text(0.03, y, title, adj = c(0, 1), cex = 1.05, font = 2,
-               col = "#111111")
-          y - 0.022
+        # --- Layout primitives -------------------------------------------
+        # Text is TOP-anchored at y. Heights and widths are MEASURED with
+        # strheight()/strwidth() rather than guessed, which is what caused
+        # titles to collide and separator rules to strike through text.
+        L <- 0.03; R <- 0.97
+        th <- function(cex, font = 1) strheight("Ag", cex = cex, font = font)
+        tw <- function(s, cex, font = 1) strwidth(s, cex = cex, font = font)
+        put <- function(x, y, s, cex = 0.76, font = 1, col = "#222222",
+                        adj = 0) {
+          text(x, y, ascii(s), adj = c(adj, 1), cex = cex, font = font,
+               col = col)
+          invisible(y - th(cex, font))
         }
-        # Radar drawn in figure coords. The plot window is 0-1 on both axes
-        # but the page is 8.5x11in, so x user-units are physically shorter:
-        # rx = ry * 11/8.5 keeps the chart actually circular.
+        # Rule sits a clear gap BELOW the text block that precedes it.
+        rule <- function(y, col = "#999999", lwd = 0.8, gap = 0.006) {
+          yy <- y - gap
+          segments(L, yy, R, yy, col = col, lwd = lwd)
+          yy - gap
+        }
+        sec <- function(y, title) {
+          y <- put(L, y, title, cex = 1.0, font = 2, col = "#111111")
+          y - 0.008
+        }
+
+        hbar <- function(x0, y, w, frac, label, val, good) {
+          h <- 0.013
+          rect(x0, y - h, x0 + w, y, col = "#EEEEEE", border = NA)
+          rect(x0, y - h, x0 + w * max(0, min(1, frac)), y,
+               col = if (good) "#4C9A00" else "#B8860B", border = NA)
+          text(x0 - 0.006, y - h / 2, ascii(label), adj = c(1, 0.5),
+               cex = 0.70)
+          text(x0 + w + 0.008, y - h / 2, ascii(val), adj = c(0, 0.5),
+               cex = 0.70, font = 2)
+          y - h - 0.008
+        }
+
+        # Radar, drawn circular despite the 8.5x11 page (rx scaled by 11/8.5).
         draw_radar <- function(cx, cy, ry, labels, scores, rmax) {
           n <- length(labels)
           rx <- ry * 11 / 8.5
-          ang <- 2 * pi * (seq_len(n) - 1) / n   # from vertical, clockwise
+          ang <- 2 * pi * (seq_len(n) - 1) / n
           px <- function(rr, a) cx + rx * (rr / rmax) * sin(a)
           py <- function(rr, a) cy + ry * (rr / rmax) * cos(a)
-
           aa <- seq(0, 2 * pi, length.out = 120)
-          for (ring in c(50, 100, rmax)) {
+          for (ring in c(50, 100, rmax))
             lines(px(ring, aa), py(ring, aa),
                   col = if (ring == 100) "#8A8A8A" else "#DDDDDD",
                   lty = if (ring == 100) 2 else 1,
                   lwd = if (ring == 100) 1.1 else 0.5)
-          }
           segments(cx, cy, px(rmax, ang), py(rmax, ang),
                    col = "#DDDDDD", lwd = 0.5)
-          # Cohort reference polygon sits at 100 on every axis.
           polygon(px(rep(100, n), ang), py(rep(100, n), ang),
                   border = "#B8860B", lty = 2, lwd = 1.3)
           sc <- pmin(scores, rmax)
@@ -596,139 +608,170 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
           for (i in seq_len(n)) {
             a <- ang[i]
             adj <- if (sin(a) > 0.3) 0 else if (sin(a) < -0.3) 1 else 0.5
-            text(px(rmax * 1.17, a), py(rmax * 1.17, a), labels[i],
-                 cex = 0.55, col = "#222222", adj = c(adj, 0.5))
+            text(px(rmax * 1.17, a), py(rmax * 1.17, a), ascii(labels[i]),
+                 cex = 0.52, col = "#222222", adj = c(adj, 0.5))
           }
-          text(cx, cy - ry * 1.42, "gold dashes = cohort average (100)",
-               cex = 0.5, col = "#777777")
         }
 
-        # Compact axis labels so they fit around a 1in radar.
+        # Readiness line chart (same construction as the ACWR panel).
+        draw_readiness <- function(d, x0, x1, y_top, h) {
+          yt <- y_top; yb <- y_top - h
+          n <- nrow(d)
+          xs <- if (n > 1) x0 + (x1 - x0) * (seq_len(n) - 1) / (n - 1)
+                else rep((x0 + x1) / 2, n)
+          ry <- function(v) yb + (yt - yb) * pmin(pmax(v, 0), 100) / 100
+          for (v in c(25, 50, 75, 100)) {
+            segments(x0, ry(v), x1, ry(v), col = "#E8E8E8", lwd = 0.4)
+            text(x0 - 0.006, ry(v), v, adj = c(1, 0.5), cex = 0.5,
+                 col = "#777777")
+          }
+          # 70% working reference line.
+          segments(x0, ry(70), x1, ry(70), col = "#B8860B", lty = 2,
+                   lwd = 0.8)
+          segments(x0, yb, x1, yb, col = "#333333", lwd = 0.8)
+          segments(x0, yb, x0, yt, col = "#333333", lwd = 0.8)
+          lines(xs, ry(d$readiness), col = "#1E8449", lwd = 1.6)
+          flag <- !is.na(d$z_flag) & d$z_flag
+          points(xs[!flag], ry(d$readiness[!flag]), pch = 19, cex = 0.4,
+                 col = "#1E8449")
+          if (any(flag))
+            points(xs[flag], ry(d$readiness[flag]), pch = 19, cex = 0.62,
+                   col = "#C0392B")
+          idx <- unique(round(seq(1, n, length.out = min(6, n))))
+          for (i in idx)
+            text(xs[i], yb - 0.004, format(d$date[i], "%b %d"),
+                 adj = c(0.5, 1), cex = 0.5, col = "#777777")
+          yb - 0.020
+        }
+
         short_lab <- function(x) {
-          x <- gsub("CMJ Jump Height", "CMJ", x, fixed = TRUE)
-          x <- gsub("IMTP Peak Force", "IMTP", x, fixed = TRUE)
-          x <- gsub("Chin Up 1RM", "ChinUp", x, fixed = TRUE)
-          x <- gsub("Squat 3RM", "Squat", x, fixed = TRUE)
-          x <- gsub("Bench 3RM", "Bench", x, fixed = TRUE)
-          x <- gsub("Body Fat %", "BF%", x, fixed = TRUE)
-          x <- gsub("Distance", "Dist", x, fixed = TRUE)
-          x <- gsub("Max vel", "Vmax", x, fixed = TRUE)
+          x <- gsub("CMJ Jump Height \\(cm\\)", "CMJ", x)
+          x <- gsub("CMJ Jump Height", "CMJ", x)
+          x <- gsub("IMTP Peak Force", "IMTP", x)
+          x <- gsub("Chin Up 1RM", "ChinUp", x)
+          x <- gsub("Squat 3RM", "Squat", x); x <- gsub("Bench 3RM", "Bench", x)
+          x <- gsub("Body Fat %", "BF%", x);  x <- gsub("Distance", "Dist", x)
+          x <- gsub("Max vel", "Vmax", x)
           ascii(x)
         }
 
-        # Horizontal bar drawn in figure coords (0-1 space).
-        hbar <- function(x0, y, w, frac, label, val, good) {
-          rect(x0, y - 0.014, x0 + w, y, col = "#EEEEEE", border = NA)
-          rect(x0, y - 0.014, x0 + w * max(0, min(1, frac)), y,
-               col = if (good) "#4C9A00" else "#B8860B", border = NA)
-          text(x0 - 0.005, y - 0.007, label, adj = c(1, 0.5), cex = 0.72)
-          text(x0 + w + 0.008, y - 0.007, val, adj = c(0, 0.5), cex = 0.72,
-               font = 2)
-        }
+        # --- Header --------------------------------------------------------
+        y <- 0.975
+        y <- put(L, y, info$name, cex = 1.75, font = 2, col = "#111111")
+        y <- y - 0.004
+        y <- put(L, y, sprintf("%s  |  Top speed %s m/s  |  %d matches, %d min",
+                               info$cohort,
+                               if (is.finite(info$vmax))
+                                 sprintf("%.2f", info$vmax) else "n/a",
+                               nrow(m),
+                               round(sum(m$match_minutes, na.rm = TRUE))),
+                 cex = 0.88, col = "#444444")
+        y <- rule(y, col = "#222222", lwd = 1.6, gap = 0.008)
+        y <- y - 0.010
 
-        # Match output vs benchmark
-        y <- y - 0.028
+        # --- Match output vs benchmark -------------------------------------
         y <- sec(y, "MATCH OUTPUT vs COHORT BENCHMARK (per minute)")
         if (nrow(bd) > 0) {
-          for (i in seq_len(nrow(bd))) {
-            hbar(0.20, y, 0.52, bd$pct[i] / 130, ascii(bd$metric[i]),
-                 sprintf("%.0f%%", bd$pct[i]), bd$pct[i] >= 100)
-            y <- y - 0.026
-          }
-          text(0.20, y, "(bar scale: 0-130% of benchmark)", adj = c(0, 1),
-               cex = 0.62, col = "#777777")
-          y <- y - 0.016
+          for (i in seq_len(nrow(bd)))
+            y <- hbar(0.17, y, 0.46, bd$pct[i] / 130, bd$metric[i],
+                      sprintf("%.0f%%  (bench %s)", bd$pct[i],
+                              format(round(bd$bench_80[i]), big.mark = ",")),
+                      bd$pct[i] >= 100)
+          y <- put(0.17, y, "bar scale: 0-130% of benchmark", cex = 0.58,
+                   col = "#777777")
         } else {
-          text(0.06, y, "No match data.", adj = c(0, 1), cex = 0.8,
-               col = "#666666"); y <- y - 0.024
+          y <- put(0.06, y, "No match data.", cex = 0.76, col = "#666666")
         }
-
-        # Testing percentiles (left) + cohort radar (right, same band)
         y <- y - 0.014
+
+        # --- Testing bars (left) + radar (right), same vertical band -------
         band_top <- y
-        y <- sec(y, paste0("PERFORMANCE TESTING - ",
-                           toupper(ascii(info$cohort)), " PERCENTILE"))
+        left_title <- "PERFORMANCE TESTING"
+        y <- sec(y, left_title)
         if (nrow(td) > 0) {
-          # Same fixed order as the on-screen chart.
-          tp <- td |>
-            mutate(.ord = match(label, REPORT_METRICS$label)) |>
-            arrange(.ord)
-          for (i in seq_len(nrow(tp))) {
-            hbar(0.21, y, 0.25, tp$pct[i] / 100, ascii(tp$label[i]),
-                 sprintf("%.0fth (%s)", tp$pct[i],
-                         formatC(tp$value[i], format = "f", digits = 2)),
-                 tp$pct[i] >= 50)
-            y <- y - 0.023
-          }
+          tp <- td |> mutate(.o = match(label, REPORT_METRICS$label)) |>
+            arrange(.o)
+          for (i in seq_len(nrow(tp)))
+            y <- hbar(0.20, y, 0.24, tp$pct[i] / 100, short_lab(tp$label[i]),
+                      sprintf("%.0fth (%s)", tp$pct[i],
+                              fmt_metric_value(tp$value[i])),
+                      tp$pct[i] >= 50)
         } else {
-          text(0.06, y, "No testing data.", adj = c(0, 1), cex = 0.8,
-               col = "#666666"); y <- y - 0.024
+          y <- put(0.06, y, "No testing data.", cex = 0.76, col = "#666666")
         }
 
-        # Radar occupies the right half of the same vertical band, so it
-        # costs no extra page height.
         if (nrow(sp) >= 3) {
-          text(0.72, band_top,
-               paste0("vs ", toupper(ascii(info$cohort)), " - ",
-                      if (sp_mode == "match") "MATCH OUTPUT" else "TESTING"),
-               adj = c(0.5, 1), cex = 0.72, font = 2, col = "#111111")
+          # Place the radar's caption so it cannot collide with the section
+          # title on the left: start it past the measured title width.
+          rad_cx <- 0.80
+          cap <- sprintf("vs %s - %s", info$cohort,
+                         if (sp_mode == "match") "MATCH" else "TESTING")
+          cap_w <- tw(cap, 0.68, 2)
+          cap_x <- max(rad_cx - cap_w / 2,
+                       L + tw(left_title, 1.0, 2) + 0.03)
+          put(cap_x, band_top, cap, cex = 0.68, font = 2, col = "#111111")
           rmax_pdf <- max(140, ceiling(max(sp$score, na.rm = TRUE) / 10) * 10)
-          draw_radar(cx = 0.755, cy = band_top - 0.125, ry = 0.082,
+          draw_radar(cx = rad_cx, cy = band_top - 0.135, ry = 0.078,
                      labels = short_lab(sp$label), scores = sp$score,
                      rmax = rmax_pdf)
+          text(rad_cx, band_top - 0.245, "gold dashes = cohort average (100)",
+               cex = 0.5, col = "#777777")
+          y <- min(y, band_top - 0.262)
         }
-        y <- min(y, band_top - 0.235)
+        y <- y - 0.014
 
-        # Match log table
-        y <- y - 0.016
+        # --- Match log ------------------------------------------------------
         y <- sec(y, "MATCH LOG")
-        cols <- c(0.05, 0.17, 0.36, 0.45, 0.57, 0.69, 0.82)
-        hdr <- c("Date", "Opponent", "Min", "Dist (m)", "m/min", "HSR (m)",
-                 "A+D")
+        cols <- c(0.04, 0.17, 0.37, 0.46, 0.58, 0.70, 0.84)
+        hdr  <- c("Date", "Opponent", "Min", "Dist (m)", "m/min", "HSR (m)",
+                  "A+D")
         for (j in seq_along(hdr))
-          text(cols[j], y, hdr[j], adj = c(0, 1), cex = 0.68, font = 2,
-               col = "#666666")
-        y <- y - 0.006
-        segments(0.03, y, 0.97, y, col = "#999999")
-        y <- y - 0.016
+          put(cols[j], y, hdr[j], cex = 0.66, font = 2, col = "#666666")
+        y <- rule(y - th(0.66, 2), gap = 0.005)
         if (nrow(m) > 0) {
-          ml <- m |> arrange(desc(date)) |> head(10)
+          # Cap rows so the wellness panel below always has room.
+          room <- y - 0.20
+          max_rows <- max(3, floor(room / 0.0175))
+          ml <- m |> arrange(desc(date)) |> head(min(10, max_rows))
           for (i in seq_len(nrow(ml))) {
             vals <- c(format(ml$date[i], "%b %d"),
-                      ascii(substr(coalesce(ml$opponent[i], "-"), 1, 16)),
+                      substr(coalesce(ml$opponent[i], "-"), 1, 18),
                       as.character(round(ml$match_minutes[i])),
                       format(round(ml$distance[i]), big.mark = ","),
                       sprintf("%.1f", ml$distance[i] / ml$match_minutes[i]),
                       format(round(ml$hsr_distance[i]), big.mark = ","),
                       as.character(ml$accels[i] + coalesce(ml$decels[i], 0)))
-            for (j in seq_along(vals))
-              text(cols[j], y, vals[j], adj = c(0, 1), cex = 0.7)
-            y <- y - 0.019
+            for (j in seq_along(vals)) put(cols[j], y, vals[j], cex = 0.70)
+            y <- y - 0.0175
           }
         }
-
-        # Wellness footer
         y <- y - 0.012
-        y <- sec(y, "WELLNESS (last 21 days)")
+
+        # --- Wellness -------------------------------------------------------
+        y <- sec(y, "READINESS - LAST 21 DAYS")
         if (nrow(wl) > 0) {
-          last <- wl |> slice_max(date, n = 1, with_ties = FALSE)
-          text(0.06, y, sprintf(
-            "Latest readiness %.0f%%   |   21-day mean %.0f%%   |   flags: %d",
-            last$readiness, mean(wl$readiness, na.rm = TRUE),
-            sum(wl$z_flag, na.rm = TRUE)),
-            adj = c(0, 1), cex = 0.8)
-          y <- y - 0.02
+          wlo <- wl |> arrange(date)
+          y <- draw_readiness(wlo, 0.10, 0.74, y, 0.105)
+          last <- wlo |> slice_max(date, n = 1, with_ties = FALSE)
+          y <- put(L, y, sprintf(
+            "Latest %.0f%%  |  21-day mean %.0f%%  |  z-flags: %d  |  dashed line = 70%%",
+            last$readiness, mean(wlo$readiness, na.rm = TRUE),
+            sum(wlo$z_flag, na.rm = TRUE)), cex = 0.70)
           if (isTRUE(last$injury_flag))
-            text(0.06, y, ascii(paste("Reported:", last$aches)),
-                 adj = c(0, 1), cex = 0.8, col = "#B22222")
+            y <- put(L, y, paste("Reported:", last$aches), cex = 0.70,
+                     col = "#B22222")
         } else {
-          text(0.06, y, "No wellness submissions.", adj = c(0, 1),
-               cex = 0.8, col = "#666666")
+          y <- put(0.06, y, "No wellness submissions.", cex = 0.76,
+                   col = "#666666")
         }
 
-        text(0.03, 0.02, paste("Life University Rugby AMS  |  generated",
-                               format(Sys.Date(), "%b %d, %Y")),
-             adj = c(0, 0), cex = 0.62, col = "#888888")
+        ver <- tryCatch(if (exists("APP_VERSION")) APP_VERSION else "",
+                        error = function(e) "")
+        text(L, 0.015, ascii(paste0(
+          "Life University Rugby AMS  |  generated ",
+          format(Sys.Date(), "%b %d, %Y"),
+          if (nzchar(ver)) paste0("  |  build ", ver) else "")),
+          adj = c(0, 0), cex = 0.58, col = "#888888")
       })
   })
 }
