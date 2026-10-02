@@ -36,7 +36,7 @@ suppressPackageStartupMessages({
 # immediately obvious whether a deployment is actually running the new code
 # or an older cached build -- otherwise "I republished but nothing changed"
 # is indistinguishable from "the change didn't work".
-APP_VERSION <- "2026-10-02b · readiness chart + PDF spacing"
+APP_VERSION <- "2026-10-02c · header leading"
 
 # Each file carries a short string unique to its current version. app.R
 # checks these at startup and names any file whose deployed copy is older
