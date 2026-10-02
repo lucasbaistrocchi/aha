@@ -39,6 +39,26 @@ if (!file.exists(file.path("R", "global.R"))) {
   }
 }
 
+# Record where the app actually loaded its code from, and whether another
+# copy of R/global.R exists elsewhere in the deployment. Two copies is the
+# quiet failure mode behind "the file is on GitHub but the app is still
+# running old code": uploads land in one copy, the app loads the other.
+APP_DIR_INFO <- tryCatch({
+  wd <- normalizePath(getwd(), winslash = "/")
+  parent <- dirname(wd)
+  cand <- c(parent, list.dirs(parent, recursive = FALSE),
+            list.dirs(wd, recursive = FALSE))
+  others <- character(0)
+  for (d in unique(cand)) {
+    p <- file.path(d, "R", "global.R")
+    if (file.exists(p)) {
+      dn <- normalizePath(d, winslash = "/")
+      if (!identical(dn, wd)) others <- c(others, dn)
+    }
+  }
+  list(wd = wd, others = unique(others))
+}, error = function(e) list(wd = "unknown", others = character(0)))
+
 # Source global.R FIRST -- it attaches every package. The rest of R/ runs
 # top-level code (constant tables built with tribble(), etc.) that needs
 # those packages already loaded. Sourcing the folder alphabetically would
@@ -128,12 +148,43 @@ server <- function(input, output, session) {
 
   output$shell <- renderUI({
     if (!authed()) return(login_screen(login_msg()))
+    stale <- tryCatch(
+      if (exists("stale_source_files")) stale_source_files() else character(0),
+      error = function(e) character(0))
+
+    # If stale_source_files() doesn't exist, global.R itself is out of date
+    # -- report that explicitly rather than showing nothing, which is
+    # indistinguishable from "everything is fine".
+    if (!exists("stale_source_files"))
+      stale <- c(stale, "R/global.R (older than app.R)")
+
     tagList(
       if (!nzchar(app_password()))
         div(style = paste0("background:", AMS_COLORS$red,
                            ";color:white;padding:5px 12px;font-weight:600;",
                            "font-size:0.82rem;"),
             "No APP_PASSWORD set — this deployment is unprotected."),
+      # Names files whose deployed copy is older than the code expects, so a
+      # partial upload is visible immediately rather than looking like a
+      # feature that silently failed.
+      if (length(stale))
+        div(style = paste0("background:", AMS_COLORS$gold,
+                           ";color:#0A0A0A;padding:5px 12px;font-weight:600;",
+                           "font-size:0.82rem;"),
+            paste("Out-of-date file(s) on this deployment —",
+                  "re-upload and republish:", paste(stale, collapse = ", "))),
+      # Duplicate code trees: the app can only run one of them.
+      if (length(APP_DIR_INFO$others))
+        div(style = paste0("background:", AMS_COLORS$red,
+                           ";color:white;padding:5px 12px;font-weight:600;",
+                           "font-size:0.80rem;"),
+            paste0("Two copies of the code are deployed. Running from: ",
+                   APP_DIR_INFO$wd, " — another R/global.R also exists at: ",
+                   paste(APP_DIR_INFO$others, collapse = ", "),
+                   ". Delete the copy you are NOT editing.")),
+      div(style = paste0("background:#151515;color:#8A8A8A;padding:3px 12px;",
+                         "font-size:0.70rem;"),
+          paste("Running from:", APP_DIR_INFO$wd)),
       app_body()
     )
   })
