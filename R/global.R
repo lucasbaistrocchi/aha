@@ -36,7 +36,7 @@ suppressPackageStartupMessages({
 # immediately obvious whether a deployment is actually running the new code
 # or an older cached build -- otherwise "I republished but nothing changed"
 # is indistinguishable from "the change didn't work".
-APP_VERSION <- "2026-10-02 · ACWR chart in longitudinal PDF"
+APP_VERSION <- "2026-10-02b · readiness chart + PDF spacing"
 
 # Each file carries a short string unique to its current version. app.R
 # checks these at startup and names any file whose deployed copy is older
@@ -45,7 +45,7 @@ APP_VERSION <- "2026-10-02 · ACWR chart in longitudinal PDF"
 # behaviour changes.
 EXPECTED_MARKERS <- list(
   "R/mod_longitudinal.R" = "draw_acwr_panel",
-  "R/mod_individual.R"   = "percentile (n=%d)",
+  "R/mod_individual.R"   = "draw_readiness",
   "R/mod_weekly_load.R"  = "week_choices",
   "R/mod_match_day.R"    = "Match Day Report",
   "R/mod_match_minutes.R" = "Chronic Match Exposure",
