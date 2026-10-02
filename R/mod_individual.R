@@ -656,9 +656,12 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
         }
 
         # --- Header --------------------------------------------------------
+        # Leading is proportional to the type size: strheight() measures the
+        # glyphs only, so a 1.75-cex name needs real space beneath it before
+        # the subtitle, otherwise the two read as one bunched block.
         y <- 0.975
         y <- put(L, y, info$name, cex = 1.75, font = 2, col = "#111111")
-        y <- y - 0.004
+        y <- y - 0.40 * th(1.75, 2)
         y <- put(L, y, sprintf("%s  |  Top speed %s m/s  |  %d matches, %d min",
                                info$cohort,
                                if (is.finite(info$vmax))
@@ -666,8 +669,8 @@ mod_individual_server <- function(id, data, wellness_scored, vaccine) {
                                nrow(m),
                                round(sum(m$match_minutes, na.rm = TRUE))),
                  cex = 0.88, col = "#444444")
-        y <- rule(y, col = "#222222", lwd = 1.6, gap = 0.008)
-        y <- y - 0.010
+        y <- rule(y, col = "#222222", lwd = 1.6, gap = 0.012)
+        y <- y - 0.014
 
         # --- Match output vs benchmark -------------------------------------
         y <- sec(y, "MATCH OUTPUT vs COHORT BENCHMARK (per minute)")
