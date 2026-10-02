@@ -544,8 +544,13 @@ pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
     y <- y - need
     segments(0, y + 0.006, 1, y + 0.006, col = "#DDDDDD", lwd = 0.4)
   }
-  text(0, 0.02, pdf_ascii(paste("Life University Rugby AMS  |  generated",
-                                format(Sys.Date(), "%b %d, %Y"))),
+  # Stamp the build into every export: a PDF then states for itself which
+  # version of the app produced it, instead of being inferred from content.
+  ver <- tryCatch(if (exists("APP_VERSION")) APP_VERSION else "unknown",
+                  error = function(e) "unknown")
+  text(0, 0.02, pdf_ascii(paste0("Life University Rugby AMS  |  generated ",
+                                 format(Sys.Date(), "%b %d, %Y"),
+                                 "  |  build ", ver)),
        adj = c(0, 0), cex = 0.62, col = "#888888")
 }
 
