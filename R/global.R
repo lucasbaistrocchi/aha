@@ -36,7 +36,37 @@ suppressPackageStartupMessages({
 # immediately obvious whether a deployment is actually running the new code
 # or an older cached build -- otherwise "I republished but nothing changed"
 # is indistinguishable from "the change didn't work".
-APP_VERSION <- "2026-09-29 · cohort percentiles + WoW bands"
+APP_VERSION <- "2026-10-02 · ACWR chart in longitudinal PDF"
+
+# Each file carries a short string unique to its current version. app.R
+# checks these at startup and names any file whose deployed copy is older
+# than expected -- turning "I republished but nothing changed" into a
+# specific list of files to re-upload. Update a marker when that file's
+# behaviour changes.
+EXPECTED_MARKERS <- list(
+  "R/mod_longitudinal.R" = "draw_acwr_panel",
+  "R/mod_individual.R"   = "percentile (n=%d)",
+  "R/mod_weekly_load.R"  = "week_choices",
+  "R/mod_match_day.R"    = "Match Day Report",
+  "R/mod_match_minutes.R" = "Chronic Match Exposure",
+  "R/mod_testing.R"      = "test_display_name",
+  "R/mod_speed_vaccine.R" = "vaccine_plot_ui",
+  "R/mod_home.R"         = "cohort_bar_ui",
+  "R/mod_availability.R" = "apply_sort",
+  "R/utils_metrics.R"    = "compute_cohort_weekly",
+  "R/data_sources.R"     = "parse_sheet_datetime"
+)
+
+# Files whose deployed copy predates the marker above.
+stale_source_files <- function() {
+  out <- character(0)
+  for (f in names(EXPECTED_MARKERS)) {
+    if (!file.exists(f)) { out <- c(out, paste0(f, " (missing)")); next }
+    txt <- paste(readLines(f, warn = FALSE), collapse = "\n")
+    if (!grepl(EXPECTED_MARKERS[[f]], txt, fixed = TRUE)) out <- c(out, f)
+  }
+  out
+}
 
 app_build_time <- function() {
   fs <- c("app.R", list.files("R", full.names = TRUE, pattern = "\\.R$"))
@@ -460,9 +490,12 @@ pdf_ascii <- function(x) {
 # `note_fn(i)` optionally returns a longer string for row i (a prescription,
 # an action) drawn wrapped in smaller grey type beneath that row; row height
 # grows to fit, and pagination accounts for it.
+# `header_draw(y)` draws extra content (a chart) below the title on the FIRST
+# page only and returns the y to continue from; later pages start clean.
 pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
                       row_h = 0.019, note_fn = NULL, note_x = 0.04,
-                      note_width = 105) {
+                      note_width = 105, header_draw = NULL) {
+  first_page <- TRUE
   draw_head <- function() {
     par(mar = c(0.4, 0.6, 0.4, 0.6))
     plot.new(); plot.window(xlim = c(0, 1), ylim = c(0, 1))
@@ -473,6 +506,10 @@ pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
       text(0, y, pdf_ascii(subtitle), adj = c(0, 1), cex = 0.88,
            col = "#444444")
       y <- y - 0.024
+    }
+    if (first_page && !is.null(header_draw)) {
+      y <- header_draw(y)
+      first_page <<- FALSE
     }
     for (cl in cols)
       text(cl$x, y, cl$label, adj = c(if (identical(cl$align, "right")) 1
@@ -507,8 +544,13 @@ pdf_table <- function(title, subtitle, cols, rows, colour_fn = NULL,
     y <- y - need
     segments(0, y + 0.006, 1, y + 0.006, col = "#DDDDDD", lwd = 0.4)
   }
-  text(0, 0.02, pdf_ascii(paste("Life University Rugby AMS  |  generated",
-                                format(Sys.Date(), "%b %d, %Y"))),
+  # Stamp the build into every export: a PDF then states for itself which
+  # version of the app produced it, instead of being inferred from content.
+  ver <- tryCatch(if (exists("APP_VERSION")) APP_VERSION else "unknown",
+                  error = function(e) "unknown")
+  text(0, 0.02, pdf_ascii(paste0("Life University Rugby AMS  |  generated ",
+                                 format(Sys.Date(), "%b %d, %Y"),
+                                 "  |  build ", ver)),
        adj = c(0, 0), cex = 0.62, col = "#888888")
 }
 
