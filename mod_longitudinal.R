@@ -183,7 +183,57 @@ mod_longitudinal_server <- function(id, data) {
       )
     })
 
-    # --- PDF export: weekly breakdown for the current selection -------------
+    # Draw the ACWR series in base graphics on the open pdf() page, inside
+    # the 0-1 coordinate space pdf_table() sets up. Returns the y to carry
+    # on from, so the weekly table follows directly underneath.
+    draw_acwr_panel <- function(d, y_top, metric_lbl) {
+      if (is.null(d) || nrow(d) == 0) return(y_top)
+      d <- d |> arrange(date)
+      x0 <- 0.11; x1 <- 0.98
+      yt <- y_top - 0.018
+      yb <- yt - 0.235
+      n  <- nrow(d)
+      xs <- if (n > 1) x0 + (x1 - x0) * (seq_len(n) - 1) / (n - 1)
+            else rep((x0 + x1) / 2, n)
+
+      amax <- 2.2
+      ay <- function(v) yb + (yt - yb) * pmin(pmax(v, 0), amax) / amax
+
+      # 0.8-1.5 "sweet spot" band, then daily load as light bars behind.
+      rect(x0, ay(THRESHOLDS$acwr_low), x1, ay(THRESHOLDS$acwr_high),
+           col = "#EDEDED", border = NA)
+      lmax <- suppressWarnings(max(d$daily_load, na.rm = TRUE))
+      if (is.finite(lmax) && lmax > 0) {
+        bh <- (yt - yb) * 0.34
+        segments(xs, yb, xs, yb + bh * d$daily_load / lmax,
+                 col = "#C9C9C9", lwd = 0.6)
+      }
+      for (v in c(0.5, 1.0, 1.5, 2.0)) {
+        segments(x0, ay(v), x1, ay(v), col = "#E0E0E0", lwd = 0.4)
+        text(x0 - 0.008, ay(v), sprintf("%.1f", v), adj = c(1, 0.5),
+             cex = 0.55, col = "#666666")
+      }
+      segments(x0, yb, x1, yb, col = "#333333", lwd = 0.8)
+      segments(x0, yb, x0, yt, col = "#333333", lwd = 0.8)
+
+      ok <- !is.na(d$acwr)
+      if (any(ok)) lines(xs[ok], ay(d$acwr[ok]), col = "#1E8449", lwd = 1.8)
+
+      idx <- unique(round(seq(1, n, length.out = min(7, n))))
+      for (i in idx) {
+        segments(xs[i], yb, xs[i], yb - 0.005, col = "#333333", lwd = 0.6)
+        text(xs[i], yb - 0.009, format(d$date[i], "%b %d"),
+             adj = c(0.5, 1), cex = 0.55, col = "#666666")
+      }
+      text(x0, yt + 0.010, pdf_ascii(sprintf(
+        "ACWR (line) and daily %s (bars); shaded band = %.1f-%.1f",
+        metric_lbl, THRESHOLDS$acwr_low, THRESHOLDS$acwr_high)),
+        adj = c(0, 0), cex = 0.6, col = "#555555")
+
+      yb - 0.034
+    }
+
+    # --- PDF export: ACWR chart + weekly breakdown --------------------------
     output$export_pdf <- downloadHandler(
       filename = function()
         paste0("longitudinal-",
@@ -192,13 +242,21 @@ mod_longitudinal_server <- function(id, data) {
       content = function(file) {
         w <- weekly_data()
         has_h <- isTRUE(data()$has_hmld)
-        acwr_now <- tryCatch({
-          a <- if (is_cohort())
+        # Keep the whole series for the chart, not just the latest value.
+        acwr_series <- tryCatch({
+          if (is_cohort())
             compute_cohort_acwr(data()$gps, input$athlete, input$load_metric)
           else acwr_data() |> filter(athlete_name == input$athlete)
-          a <- a |> filter(!is.na(acwr))
-          if (nrow(a)) tail(a$acwr, 1) else NA_real_
-        }, error = function(e) NA_real_)
+        }, error = function(e) NULL)
+        acwr_now <- {
+          a <- if (is.null(acwr_series)) NULL else
+            acwr_series |> filter(!is.na(acwr))
+          if (!is.null(a) && nrow(a)) tail(a$acwr, 1) else NA_real_
+        }
+        metric_lbl <- names(which(
+          c("PlayerLoad" = "player_load", "Distance (m)" = "distance",
+            "HSR (m)" = "hsr_distance", "HMLD (m)" = "hmld") ==
+            input$load_metric))[1] %||% input$load_metric
 
         num <- function(x) formatC(round(x), big.mark = ",", format = "d")
         pct <- function(x) if (is.na(x)) "-" else sprintf("%+.0f%%", x)
@@ -244,13 +302,13 @@ mod_longitudinal_server <- function(id, data) {
             "%s | metric: %s | latest ACWR: %s | weeks Mon-Sun%s",
             if (is_cohort()) "Position group (per-athlete averages)"
               else "Individual athlete",
-            names(which(c("PlayerLoad" = "player_load",
-                          "Distance (m)" = "distance", "HSR (m)" = "hsr_distance",
-                          "HMLD (m)" = "hmld") == input$load_metric))[1] %||%
-              input$load_metric,
+            metric_lbl,
             if (is.na(acwr_now)) "n/a" else sprintf("%.2f", acwr_now),
-            sprintf("  |  change flagged beyond +/-%.0f%%", lim)),
-          cols = cols, rows = rows, colour_fn = colour_fn)
+            sprintf("  |  OK within +/-%.0f%%, HIGH beyond +/-%.0f%%",
+                    lim, THRESHOLDS$wow_watch_pct * 100)),
+          cols = cols, rows = rows, colour_fn = colour_fn,
+          header_draw = function(y)
+            draw_acwr_panel(acwr_series, y, metric_lbl))
       })
 
     output$wow_table <- renderReactable({
